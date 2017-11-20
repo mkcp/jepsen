@@ -8,12 +8,14 @@
              [client     :as client]
              [control    :as c]
              [generator  :as gen]
+             [independent :as independent]
              [nemesis    :as nemesis]
              [tests      :as tests]
              [util       :refer [timeout]]
              [cli :as cli]]
             [jepsen.control.net :as net]
-            [jepsen.control.util :as net/util]
+            [jepsen.control.util :as cu]
+            [jepsen.checker.timeline :as timeline]
             [clj-http.client          :as http]
             [cheshire.core            :as json]
             [jepsen.os.debian   :as debian]
@@ -23,6 +25,11 @@
 (defn peer-addr [node] (str (name node) ":8529"))
 (defn addr [node] (str (name node) ":8529"))
 (defn cluster-info [node] (str (name node) "=http://" (name node) ":8529"))
+
+(defn deb-src [version]
+  (str "https://download.arangodb.com/arangodb32/Debian_8.0/amd64/arangodb3-" version "-1_amd64.deb"))
+
+(defn deb-dest [version] (str "arangodb3-" version "-1_amd64.deb"))
 
 (defn db [version]
   (reify db/DB
@@ -34,10 +41,10 @@
        (c/exec :echo :arangodb3 "arangodb3/password" "password" "" "|" :debconf-set-selections)
        (c/exec :echo :arangodb3 "arangodb3/password_again" "password" "" "|" :debconf-set-selections)
 
-       (c/exec :test "-f" (str "arangodb3-" version "-1_amd64.deb") "||"
-               :wget :-q (str "http://arangodb.com/repositories/unstable/Debian_8.0/amd64/" (str "arangodb3-" version "-1_amd64.deb")) :-O (str "arangodb3-" version "-1_amd64.deb"))
+       (c/exec :test "-f" (deb-dest version) "||"
+               :wget :-q (deb-src version) :-O (deb-dest version))
 
-       (c/exec :dpkg :-i (str "arangodb3-" version "-1_amd64.deb"))
+       (c/exec :dpkg :-i (deb-dest version))
 
        (c/exec :echo (-> "arangod.conf"
                          io/resource
@@ -59,7 +66,6 @@
     (teardown! [_ test node]
       (info node "tearing down arangodb agency")
       (c/su
-       ()
        (info node "stopping service arangodb3")
        (c/exec :service :arangodb3 :stop)
        (info node "nuking arangodb3 directory")
@@ -143,9 +149,10 @@
 (defn arangodb-test
   [opts]
   (merge tests/noop-test
+         opts
          {:name    "arangodb"
           :os      debian/os
-          :db      (db "3.1.alpha1")
+          :db      (db "3.2.7")
           :client  (client)
           :nemesis (nemesis/partition-random-halves)
           :generator (->> (gen/mix [r w cas])
@@ -158,9 +165,9 @@
                                     {:type :info, :f :stop}])))
                           (gen/time-limit 30))
           :model   (model/cas-register 0)
-          :checker (checker/compose {:perf   (checker/perf)
-                                     :linear checker/linearizable})}
-         opts))
+          :checker (checker/compose {:perf     (checker/perf)
+                                     :timeline (timeline/html)
+                                     :linear   (checker/linearizable)})}))
 
 (defn -main
   "Handles command line arguments. Can either run a test, or a web server for
