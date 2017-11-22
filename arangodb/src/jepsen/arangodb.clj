@@ -43,7 +43,7 @@
 ;; API call to agency directly
 (defn client-url
   ([node] (client-url node nil))
-  ([node f] (str "http://n1:" port "/_api/agency/" f)))
+  ([node f] (str "http://" node ":" port "/_api/agency/" f)))
 
 (defn db [version]
   (reify db/DB
@@ -71,31 +71,6 @@
        (c/exec :chown :-R :arangodb :/var/lib/arangodb3)
        (c/exec :chgrp :-R :arangodb :/var/lib/arangodb3)
 
-       ;; Run as daemon
-       #_(cu/start-daemon!
-        {:pidfile pidfile
-        ;:logfile logfile
-         ;:chdir   dir
-         }
-        binary
-        :--database.directory           dir
-        :--server.endpoint              (str "tcp://0.0.0.0:" port)
-        :--server.authentication        false
-        :--server.statistics            true
-        :--server.uid                   "arangodb"
-        :--javascript.startup-directory "usr/share/arangodb3/js"
-        :--javascript.app-path          "/var/lib/arangodb3-apps"
-        :--foxx.queues                  true
-        :--log.level                    "info"
-        :--log.file                     logfile
-        :--agency.activate              true
-        :--agency.size                  5
-        :--agency.endpoint              (str "tcp://" (-> test :nodes first name) port)
-        :--agency.wait-for-sync         false
-        :--agency.election-timeout-max  ".5"
-        :--agency.election-timeout-min  ".15"
-        :--agency.my-address            (str "tcp://" (net/local-ip) ":" port))
-
        ;; Run as service
        (c/exec :echo (-> "arangod.conf"
                          io/resource
@@ -104,7 +79,7 @@
                :> "/etc/arangodb3/arangod.conf")
        (c/exec :service :arangodb3 :start)
 
-       (Thread/sleep 5000)))
+       (Thread/sleep 30000)))
 
     (teardown! [_ test node]
       (info node "tearing down arangodb agency")
@@ -143,7 +118,7 @@
 
 (defn agency-cas!
   [node key old new]
-  (let [k       (str key)
+  (let [k       (keyword key)
         command [[{k new} {k old}]]
         body    (json/generate-string command)
         url     (client-url node "write")]
@@ -157,34 +132,27 @@
       first
       (get 1)))
 
-(defn unavailable? [e]
-  (->> e
-       .getMessage
-       (re-find #"503")
-       some?))
+(defn unavailable?    [e] (->> e .getMessage (re-find #"503") some?))
+(defn precond-fail?   [e] (->> e .getMessage (re-find #"412") some?))
+(defn read-timed-out? [e] (->> e .getMessage (re-find #"Read timed out") some?))
 
 ;; Flesh out the op responses here
-(defrecord CASClient [k node]
+(defrecord CASClient [node]
   client/Client
   (open! [this test node]
     (assoc this :node (name node)))
 
-  (setup! [this test]
-    ;; Create our key
-    (try
-      (agency-write! this k 0)
-      (catch Exception e
-        (info "Failed to create initial key"))))
-
   (invoke! [this test op]
-    (try
-      (let [node (:node this)]
+    (let [k     "/jepsen"
+          crash (if (= :read (:f op)) :fail :info)
+          node  (:node this)]
+      (try
         (case (:f op)
-          :read  (let [resp (agency-read! node k)]
-                   ;; FIXME Tons of :ok reads that are nil wtf
-                   (assoc op
-                          :type :ok
-                          :value (read-parse resp)))
+          :read  (let [res (agency-read! node k)
+                       val (read-parse res)]
+                   (case (:status res)
+                     200 (assoc op :type :ok :value val)
+                     307 (assoc op :type crash :error :redirect-loop)))
 
           ;; FIXME Surely not all of these writes are successful
           :write (let [value (:value op)
@@ -193,31 +161,27 @@
 
           :cas   (let [[value value'] (:value op)
                        res (agency-cas! node k value value')]
-                   (when-not (:body res) "No body found in cas response!")
                    (case (:status res)
                      200 (assoc op :type :ok)
-                     412 (assoc op :type :fail)
-                     307 (assoc op :type :info :error :307-indeterminate)))))
+                     307 (assoc op :type crash :error :redirect-loop))))
 
-      (catch Exception e
-        (cond
-          (unavailable? e) (do
-                            (error (pr-str (.getMessage e)))
-                            (assoc op :type :fail))
-          :else            (do
-                             (error (pr-str (.getMessage e)))
-                             (assoc op
-                                  :type  :info
-                                  :error :indeterminate))))))
+        (catch Exception e
+          (cond
+            (precond-fail?   e) (assoc op :type :fail :error :precondition-fail)
+            (unavailable?    e) (assoc op :type crash :error :node-unavailable)
+            (read-timed-out? e) (assoc op :type crash :error :read-timed-out)
+            :else               (do (error (pr-str (.getMessage e)))
+                                    (assoc op :type crash :error :indeterminate)))))))
 
-  ;; Client is http, connections are not stateful
+  ;; HTTP clients are not stateful
   (close! [_ _])
+  (setup! [this test])
   (teardown! [_ test]))
 
 (defn client
   "A compare and set register built around a single consul node."
-  []
-  (CASClient. "/jepsen" 0))
+  [node]
+  (CASClient. node))
 
 ;; TODO Add concurrency scaling
 (defn arangodb-test
@@ -227,7 +191,7 @@
          {:name    "arangodb"
           :os      debian/os
           :db      (db "3.2.7")
-          :client  (client)
+          :client  (client nil)
           :nemesis (nemesis/partition-random-halves)
           :generator (->> (gen/mix [r w cas])
                           (gen/stagger 1)
