@@ -1,4 +1,5 @@
 (ns jepsen.arangodb
+  "ArangoDB test, based off of work started at https://github.com/arangodb/jepsen/."
   (:require [clojure.tools.logging :refer :all]
             [clojure.java.io    :as io]
             [clojure.string     :as str]
@@ -16,15 +17,23 @@
             [jepsen.control.net :as net]
             [jepsen.control.util :as cu]
             [jepsen.checker.timeline :as timeline]
-            [clj-http.client          :as http]
-            [cheshire.core            :as json]
-            [jepsen.os.debian   :as debian]
-            [knossos.model      :as model]
-            [base64-clj.core          :as base64]))
+            [clj-http.client :as http]
+            [cheshire.core :as json]
+            [jepsen.os.debian :as debian]
+            [knossos.model :as model]
+            [base64-clj.core :as base64]))
 
-(defn peer-addr [node] (str (name node) ":8529"))
-(defn addr [node] (str (name node) ":8529"))
-(defn cluster-info [node] (str (name node) "=http://" (name node) ":8529"))
+(def dir "/var/lib/arangodb3")
+(def binary "arangod")
+(def logfile "/var/log/arangodb3/arangod.log")
+(def pidfile "/arangod.pid")
+(def port 8529)
+
+(def statuses (atom []))
+
+(defn peer-addr [node] (str (name node) ":" port ))
+(defn addr [node] (str (name node) ":" port))
+(defn cluster-info [node] (str (name node) "=http://" (name node) ":" port))
 
 (defn deb-src [version]
   (str "https://download.arangodb.com/arangodb32/Debian_8.0/amd64/arangodb3-" version "-1_amd64.deb"))
@@ -34,39 +43,68 @@
 ;; API call to agency directly
 (defn client-url
   ([node] (client-url node nil))
-  ([node f] (str "http://" node ":8529/_api/agency/" f)))
+  ([node f] (str "http://n1:" port "/_api/agency/" f)))
 
 (defn db [version]
   (reify db/DB
     (setup! [_ test node]
       (c/su
        (info node "installing arangodb" version)
+
+       ;; Deps
        (c/exec :apt-get :install "-y" "-qq" (str "libjemalloc1"))
 
+       ;; Password stuff?
        (c/exec :echo :arangodb3 "arangodb3/password" "password" "" "|" :debconf-set-selections)
        (c/exec :echo :arangodb3 "arangodb3/password_again" "password" "" "|" :debconf-set-selections)
 
-       (c/exec :test "-f" (deb-dest version) "||"
-               :wget :-q (deb-src version) :-O (deb-dest version))
-
+       ;; Download & install
+       (c/exec :test "-f" (deb-dest version) "||" :wget :-q (deb-src version) :-O (deb-dest version))
        (c/exec :dpkg :-i (deb-dest version))
 
+       ;; Ensure service stopped
+       (c/exec :service :arangodb3 :stop)
+
+       ;; Ensure data directories are clean
+       (c/exec :rm :-rf :/var/lib/arangodb3)
+       (c/exec :mkdir :/var/lib/arangodb3)
+       (c/exec :chown :-R :arangodb :/var/lib/arangodb3)
+       (c/exec :chgrp :-R :arangodb :/var/lib/arangodb3)
+
+       ;; Run as daemon
+       #_(cu/start-daemon!
+        {:pidfile pidfile
+        ;:logfile logfile
+         ;:chdir   dir
+         }
+        binary
+        :--database.directory           dir
+        :--server.endpoint              (str "tcp://0.0.0.0:" port)
+        :--server.authentication        false
+        :--server.statistics            true
+        :--server.uid                   "arangodb"
+        :--javascript.startup-directory "usr/share/arangodb3/js"
+        :--javascript.app-path          "/var/lib/arangodb3-apps"
+        :--foxx.queues                  true
+        :--log.level                    "info"
+        :--log.file                     logfile
+        :--agency.activate              true
+        :--agency.size                  5
+        :--agency.endpoint              (str "tcp://" (-> test :nodes first name) port)
+        :--agency.wait-for-sync         false
+        :--agency.election-timeout-max  ".5"
+        :--agency.election-timeout-min  ".15"
+        :--agency.my-address            (str "tcp://" (net/local-ip) ":" port))
+
+       ;; Run as service
        (c/exec :echo (-> "arangod.conf"
                          io/resource
                          slurp
                          (str/replace "$NODE_ADDRESS" (net/local-ip)))
                :> "/etc/arangodb3/arangod.conf")
-
-       (c/exec :service :arangodb3 :stop)
-       (c/exec :rm :-rf :/var/lib/arangodb3)
-       (c/exec :mkdir :/var/lib/arangodb3)
-       (c/exec :chown :-R :arangodb :/var/lib/arangodb3)
-       (c/exec :chgrp :-R :arangodb :/var/lib/arangodb3)
        (c/exec :service :arangodb3 :start)
 
-       (c/exec :sleep :5)
-
-       (info node "arangodb agency ready")))
+       (Thread/sleep 5000)))
 
     (teardown! [_ test node]
       (info node "tearing down arangodb agency")
@@ -105,40 +143,72 @@
 
 (defn agency-cas!
   [node key old new]
-  (let [bbody (json/generate-string [[{(str key) new},{(str key) old}]])
-        url   (client-url node "write")]
-    (http/post url (assoc http-opts :body bbody))))
+  (let [k       (str key)
+        command [[{k new} {k old}]]
+        body    (json/generate-string command)
+        url     (client-url node "write")]
+    (http/post url (assoc http-opts :body body))))
 
 (defn read-parse [resp]
-  (get (first (first (json/parse-string (:body resp)))) 1))
+  (-> resp
+      :body
+      json/parse-string
+      first
+      first
+      (get 1)))
 
-(defrecord CASClient [k client]
+(defn unavailable? [e]
+  (->> e
+       .getMessage
+       (re-find #"503")
+       some?))
+
+;; Flesh out the op responses here
+(defrecord CASClient [k node]
   client/Client
   (open! [this test node]
-    (let [client (name node)]
-      (assoc this :client client)))
+    (assoc this :node (name node)))
 
   (setup! [this test]
-    ;; Create our index
-    (agency-write! this k 0))
+    ;; Create our key
+    (try
+      (agency-write! this k 0)
+      (catch Exception e
+        (info "Failed to create initial key"))))
 
   (invoke! [this test op]
     (try
-      (case (:f op)
-        :read  (let [resp (agency-read! client k)]
-                 (assoc op
-                        :type :ok
-                        :value (read-parse resp)))
+      (let [node (:node this)]
+        (case (:f op)
+          :read  (let [resp (agency-read! node k)]
+                   ;; FIXME Tons of :ok reads that are nil wtf
+                   (assoc op
+                          :type :ok
+                          :value (read-parse resp)))
 
-        :write (let [value (:value op)
-                     ok? (agency-write! client k value)]
-                 (assoc op :type (if ok? :ok :fail)))
+          ;; FIXME Surely not all of these writes are successful
+          :write (let [value (:value op)
+                       ok? (agency-write! node k value)]
+                   (assoc op :type (if ok? :ok :fail)))
 
-        :cas   (let [[value value'] (:value op)
-                     ok? (agency-cas! client k value value')]
-                 (assoc op :type (if ok? :ok :fail))))
+          :cas   (let [[value value'] (:value op)
+                       res (agency-cas! node k value value')]
+                   (when-not (:body res) "No body found in cas response!")
+                   (case (:status res)
+                     200 (assoc op :type :ok)
+                     412 (assoc op :type :fail)
+                     307 (assoc op :type :info :error :307-indeterminate)))))
+
       (catch Exception e
-        (assoc op :type :info))))
+        (cond
+          (unavailable? e) (do
+                            (error (pr-str (.getMessage e)))
+                            (assoc op :type :fail))
+          :else            (do
+                             (error (pr-str (.getMessage e)))
+                             (assoc op
+                                  :type  :info
+                                  :error :indeterminate))))))
 
   ;; Client is http, connections are not stateful
   (close! [_ _])
