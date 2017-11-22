@@ -31,6 +31,11 @@
 
 (defn deb-dest [version] (str "arangodb3-" version "-1_amd64.deb"))
 
+;; API call to agency directly
+(defn client-url
+  ([node] (client-url node nil))
+  ([node f] (str "http://" node ":8529/_api/agency/" f)))
+
 (defn db [version]
   (reify db/DB
     (setup! [_ test node]
@@ -90,18 +95,18 @@
 
 (defn agency-read! [node key]
   (let [bbody (json/generate-string [[key]])
-        url   (str "http://" node ":8529/_api/agency/read")]
+        url   (client-url node "read")]
     (http/post url (assoc http-opts :body bbody))))
 
 (defn agency-write! [node key val]
-  (let [bbody (json/generate-string [[{(keyword key) val}]])
-        url (str "http://" node ":8529/_api/agency/write")]
+  (let [bbody (json/generate-string [[{(str key) val}]])
+        url   (client-url node "write")]
     (http/post url (assoc http-opts :body bbody))))
 
 (defn agency-cas!
   [node key old new]
-  (let [bbody (json/generate-string [[{(keyword key) new},{(keyword key) old}]])
-        url (str "http://" node ":8529/_api/agency/write")]
+  (let [bbody (json/generate-string [[{(str key) new},{(str key) old}]])
+        url   (client-url node "write")]
     (http/post url (assoc http-opts :body bbody))))
 
 (defn read-parse [resp]
@@ -109,35 +114,34 @@
 
 (defrecord CASClient [k client]
   client/Client
-  (setup! [this test node]
+  (open! [this test node]
     (let [client (name node)]
-      (agency-write! client k 0)
       (assoc this :client client)))
 
+  (setup! [this test]
+    ;; Create our index
+    (agency-write! this k 0))
+
   (invoke! [this test op]
-    (case (:f op)
-      :read  (try
-               (let [resp  (agency-read! client k)]
+    (try
+      (case (:f op)
+        :read  (let [resp (agency-read! client k)]
                  (assoc op
                         :type :ok
                         :value (read-parse resp)))
-               (catch Exception e
-                 ;;(warn e "r failed")
-                 (assoc op :type :fail)))
-      :write (try
-               (let [value (:value op)
+
+        :write (let [value (:value op)
                      ok? (agency-write! client k value)]
                  (assoc op :type (if ok? :ok :fail)))
-               (catch Exception e
-                 ;;(warn e "w failed")
-                 (assoc op :type :fail)))
-      :cas   (try
-               (let [[value value'] (:value op)
+
+        :cas   (let [[value value'] (:value op)
                      ok? (agency-cas! client k value value')]
-                 (assoc op :type (if ok? :ok :fail)))
-               (catch Exception e
-                 ;;(warn e "cas failed")
-                 (assoc op :type :fail)))))
+                 (assoc op :type (if ok? :ok :fail))))
+      (catch Exception e
+        (assoc op :type :info))))
+
+  ;; Client is http, connections are not stateful
+  (close! [_ _])
   (teardown! [_ test]))
 
 (defn client
