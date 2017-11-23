@@ -118,8 +118,7 @@
 (defn agency-cas!
   [node key old new]
   (let [url     (client-url node "write")
-        k       (keyword key)
-        command [[{k new} {k old}]]
+        command [[{key new} {key old}]]
         body    (json/generate-string command)]
     (http/post url (assoc http-opts :body body))))
 
@@ -146,11 +145,11 @@
           node  (:node this)]
       (try
         (case (:f op)
-          ;; FIXME What to do with read nils
           :read  (let [res (agency-read! node (str "/" k))
                        v   (read-parse res)]
-                   (when-not v (warn :read v))
-                   (assoc op :type :ok :value (independent/tuple k v)))
+                   (if v
+                     (assoc op :type :ok   :value (independent/tuple k v))
+                     (assoc op :type :fail :value (independent/tuple k v) :error :key-not-found)))
 
           :write (let [res (agency-write! node (str "/" k) v)]
                    (assoc op :type :ok))
