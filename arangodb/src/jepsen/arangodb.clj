@@ -21,29 +21,24 @@
             [cheshire.core :as json]
             [jepsen.os.debian :as debian]
             [knossos.model :as model]
-            [base64-clj.core :as base64]))
+            [base64-clj.core :as base64]
+            [jepsen.core :as jepsen]))
 
 (def dir "/var/lib/arangodb3")
 (def binary "arangod")
-(def logfile "/var/log/arangodb3/arangod.log")
+(def logfile "/arangod.log")
 (def pidfile "/arangod.pid")
 (def port 8529)
 
-(def statuses (atom []))
-
-(defn peer-addr [node] (str (name node) ":" port ))
-(defn addr [node] (str (name node) ":" port))
+;; TODO Verify that these aren't used
+(defn peer-addr [node] (str (name node) ":" port))
+(defn addr      [node] (str (name node) ":" port))
 (defn cluster-info [node] (str (name node) "=http://" (name node) ":" port))
 
 (defn deb-src [version]
   (str "https://download.arangodb.com/arangodb32/Debian_8.0/amd64/arangodb3-" version "-1_amd64.deb"))
 
 (defn deb-dest [version] (str "arangodb3-" version "-1_amd64.deb"))
-
-;; API call to agency directly
-(defn client-url
-  ([node] (client-url node nil))
-  ([node f] (str "http://" node ":" port "/_api/agency/" f)))
 
 (defn db [version]
   (reify db/DB
@@ -93,11 +88,21 @@
        (c/exec :chown :-R :arangodb :/var/lib/arangodb3)
        (c/exec :chgrp :-R :arangodb :/var/lib/arangodb3)
        (info node "Clearing log directory")
-       (c/exec :rm :-rf :/var/log/arangodb3)))
+       (c/exec :rm :-rf (keyword logfile))))
 
     db/LogFiles
     (log-files [_ test node]
-      ["/var/log/arangodb3/arangod.log"])))
+      [logfile])))
+
+;;;;;
+
+(defn unavailable?    [e] (->> e .getMessage (re-find #"503") some?))
+(defn precond-fail?   [e] (->> e .getMessage (re-find #"412") some?))
+(defn read-timed-out? [e] (->> e .getMessage (re-find #"Read timed out") some?))
+(defn already-exists? [e] (->> e .getMessage (re-find #"409") some?))
+(defn not-found?      [e] (->> e .getMessage (re-find #"404") some?))
+
+;;;;;
 
 (def http-opts {:conn-timeout 5000
                 :content-type :json
@@ -105,24 +110,28 @@
                 :redirect-strategy :lax
                 :socket-timeout 5000})
 
+(defn agency-url
+  ([node]   (agency-url node nil))
+  ([node f] (str "http://" node ":" port "/_api/agency/" f)))
+
 (defn agency-read! [node key]
-  (let [url   (client-url node "read")
+  (let [url  (agency-url node "read")
         body (json/generate-string [[key]])]
     (http/post url (assoc http-opts :body body))))
 
 (defn agency-write! [node key val]
-  (let [url   (client-url node "write")
+  (let [url  (agency-url node "write")
         body (json/generate-string [[{(str key) val}]])]
     (http/post url (assoc http-opts :body body))))
 
 (defn agency-cas!
   [node key old new]
-  (let [url     (client-url node "write")
+  (let [url     (agency-url node "write")
         command [[{key new} {key old}]]
         body    (json/generate-string command)]
     (http/post url (assoc http-opts :body body))))
 
-(defn read-parse [resp]
+(defn parse-agency-read [resp]
   (-> resp
       :body
       json/parse-string
@@ -130,11 +139,7 @@
       first
       (get 1)))
 
-(defn unavailable?    [e] (->> e .getMessage (re-find #"503") some?))
-(defn precond-fail?   [e] (->> e .getMessage (re-find #"412") some?))
-(defn read-timed-out? [e] (->> e .getMessage (re-find #"Read timed out") some?))
-
-(defrecord CASClient [node]
+(defrecord AgencyClient [node]
   client/Client
   (open! [this test node]
     (assoc this :node (name node)))
@@ -146,16 +151,18 @@
       (try
         (case (:f op)
           :read  (let [res (agency-read! node (str "/" k))
-                       v   (read-parse res)]
+                       v   (parse-agency-read res)]
                    (if v
                      (assoc op :type :ok   :value (independent/tuple k v))
                      (assoc op :type :fail :value (independent/tuple k v) :error :key-not-found)))
 
           :write (let [res (agency-write! node (str "/" k) v)]
+                   (println (pr-str res))
                    (assoc op :type :ok))
 
           :cas   (let [[v v'] v
                        res    (agency-cas! node (str "/" k) v v')]
+                   (println (pr-str res))
                    (assoc op :type :ok)))
 
         (catch Exception e
@@ -167,15 +174,98 @@
                                     (assoc op :type crash :error :indeterminate)))))))
 
   ;; HTTP clients are not stateful
-  (close! [_ _])
-  (setup! [_ _])
+  (close!    [_ _])
+  (setup!    [_ _])
   (teardown! [_ _]))
 
-(defn client [node] (CASClient. node))
+(defn agency-client [node] (AgencyClient. node))
 
-(defn r   [_ _] {:type :invoke, :f :read, :value nil})
-(defn w   [_ _] {:type :invoke, :f :write, :value (rand-int 5)})
-(defn cas [_ _] {:type :invoke, :f :cas, :value [(rand-int 5) (rand-int 5)]})
+;;;;;
+
+(def doc-opts {:conn-timeout 5000
+               :content-type :json
+               :trace-redirects true
+               :redirect-strategy :lax
+               :socket-timeout 5000})
+
+(defn doc-url
+  ([node] (str "http://" node ":" port "/_api/document/jepsen/"))
+  ([node k] (str "http://" node ":" port "/_api/document/jepsen/" k)))
+
+(defn collection-url [node]
+  (str "http://" node ":" port "/_api/collection/"))
+
+(defn doc-read! [node k]
+  (let [url (doc-url node k)]
+    (http/get url doc-opts)))
+
+(defn doc-write! [node k v]
+  (let [url  (doc-url node)
+        body (json/generate-string [{:_key (str k) :value v}])]
+    (http/put url (assoc doc-opts :body body))))
+
+;; TODO Put If-Match v'
+(defn doc-cas! [node k v v']
+  (let [url  (doc-url node)
+        body (json/generate-string [{k v} {k v'}])]
+    (http/post url (assoc doc-opts :body body))))
+
+(defn parse-doc-read [res]
+  (-> res :body json/parse-string (get "value")))
+
+(defrecord DocumentClient [node]
+  client/Client
+  (open! [this test node]
+    (assoc this :node (name node)))
+
+  (setup! [this test]
+    (info "Setting up client for node" node)
+    (try
+      (http/post (collection-url node)
+                 (assoc doc-opts
+                        :body (json/generate-string {:name "jepsen"})))
+      (doseq [i (range 0 50)]
+        (http/post (doc-url node) (assoc doc-opts :body (json/generate-string {:_key (str i) :value 0}))))
+      (catch Exception e
+        (when-not (already-exists? e)
+          (throw e)))))
+
+  (invoke! [this test op]
+    (let [[k v] (:value op)
+          crash (if (= :read (:f op)) :fail :info)
+          node  (:node this)]
+      (try
+        (case (:f op)
+          :read (let [res (doc-read! node k)
+                      v   (parse-doc-read res)]
+                  (assoc op :type :ok :value (independent/tuple k v)))
+
+          :write (let [res (doc-write! node k v)
+                       err (-> res :headers (get "X-Arango-Error-Codes"))]
+                   (if-not err
+                     (assoc op :type :ok)
+                     (assoc op :type crash :error (pr-str err))))
+
+           :cas (let [#_res #_(doc-cas! node k)]
+                  (assoc op :type :fail :error :not-implemented)))
+
+        (catch Exception e
+          (cond
+            (not-found? e) (assoc op :type crash :error :not-found)
+            :else                     (do (error (pr-str (.getMessage e)))
+                                          (assoc op :type crash :error :indeterminate)))))))
+
+  ;; HTTP clients are not stateful
+  (close! [_ _])
+  (teardown! [_ _]))
+
+(defn document-client [node] (DocumentClient. node))
+
+;;;;;
+
+(defn r   [_ _] {:type :invoke :f :read  :value nil})
+(defn w   [_ _] {:type :invoke :f :write :value (rand-int 5)})
+(defn cas [_ _] {:type :invoke :f :cas   :value [(rand-int 5) (rand-int 5)]})
 
 (defn arangodb-test
   [opts]
@@ -184,9 +274,9 @@
          {:name    "arangodb"
           :os      debian/os
           :db      (db "3.2.7")
-          :client  (client nil)
+          :client  (document-client nil)
           :nemesis (nemesis/partition-random-halves)
-          :model   (model/cas-register)
+          :model   (model/register 0)
           :checker (checker/compose
                     {:perf  (checker/perf)
                      :indep (independent/checker
@@ -197,7 +287,7 @@
                            10
                            (range)
                            (fn [k]
-                             (->> (gen/mix     [r w cas])
+                             (->> (gen/mix     [r w])
                                   (gen/stagger 1/30)
                                   (gen/limit   300))))
                           (gen/nemesis
