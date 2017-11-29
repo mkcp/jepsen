@@ -104,6 +104,12 @@
 
 ;;;;;
 
+(defn r   [_ _] {:type :invoke :f :read  :value nil})
+(defn w   [_ _] {:type :invoke :f :write :value (rand-int 5)})
+(defn cas [_ _] {:type :invoke :f :cas   :value [(rand-int 5) (rand-int 5)]})
+
+;;;;;
+
 (def http-opts {:conn-timeout 5000
                 :content-type :json
                 :trace-redirects true
@@ -157,12 +163,10 @@
                      (assoc op :type :fail :value (independent/tuple k v) :error :key-not-found)))
 
           :write (let [res (agency-write! node (str "/" k) v)]
-                   (println (pr-str res))
                    (assoc op :type :ok))
 
           :cas   (let [[v v'] v
                        res    (agency-cas! node (str "/" k) v v')]
-                   (println (pr-str res))
                    (assoc op :type :ok)))
 
         (catch Exception e
@@ -202,9 +206,11 @@
 (defn doc-write! [node k v]
   (let [url  (doc-url node)
         body (json/generate-string [{:_key (str k) :value v}])]
-    (http/put url (assoc doc-opts :body body))))
+    (http/put url (assoc doc-opts
+                         :body body
+                         :query-params {:waitForSync true}))))
 
-;; TODO Put If-Match v'
+;; TODO Get _rev from read, write If-Match _rev
 (defn doc-cas! [node k v v']
   (let [url  (doc-url node)
         body (json/generate-string [{k v} {k v'}])]
@@ -223,7 +229,11 @@
     (try
       (http/post (collection-url node)
                  (assoc doc-opts
-                        :body (json/generate-string {:name "jepsen"})))
+                        :body (json/generate-string {:name "jepsen"
+                                                     :waitForSync true
+                                                     :numberOfShards (count (:nodes test))})))
+      (println (http/get (str (collection-url node) "jepsen/properties")))
+      ;; Initialize our keyspace. Otherwise we would have to post first then put.
       (doseq [i (range 0 50)]
         (http/post (doc-url node) (assoc doc-opts :body (json/generate-string {:_key (str i) :value 0}))))
       (catch Exception e
@@ -259,50 +269,112 @@
   (close! [_ _])
   (teardown! [_ _]))
 
-(defn document-client [node] (DocumentClient. node))
+(defn document-register-client [node] (DocumentClient. node))
 
 ;;;;;
 
-(defn r   [_ _] {:type :invoke :f :read  :value nil})
-(defn w   [_ _] {:type :invoke :f :write :value (rand-int 5)})
-(defn cas [_ _] {:type :invoke :f :cas   :value [(rand-int 5) (rand-int 5)]})
+
+(defrecord DocumentSetClient [node]
+  client/Client
+  (open! [this test node])
+  (setup! [this test])
+  (invoke! [this test op])
+  (close! [this test])
+  (teardown! [this test]))
+
+(defn document-set-client [])
+
+;;;;;
+
+(defn workloads
+  "The workloads we can run. Each workload is a map like
+
+      {:generator         a generator of client ops
+       :final-generator   a generator to run after the cluster recovers
+       :client            a client to execute those ops
+       :checker           a checker
+       :model             for the checker}
+
+  Note that workloads are *stateful*, since they include generators; that's why
+  this is a function, instead of a constant--we may need a fresh workload if we
+  run more than one test."
+  []
+  {:agency-register {:client (agency-client nil)
+                     :generator (->> (independent/concurrent-generator
+                                      10
+                                      (range)
+                                      (fn [k]
+                                        (->> (gen/mix     [r w cas])
+                                             (gen/stagger 1/30)
+                                             (gen/limit   300))))
+                                     (gen/nemesis
+                                      (gen/seq (cycle [(gen/sleep 5)
+                                                       {:type :info, :f :start}
+                                                       (gen/sleep 5)
+                                                       {:type :info, :f :stop}])))
+                                     (gen/time-limit 30))
+                     :checker (independent/checker (checker/compose
+                                                    {:timeline (timeline/html)
+                                                     :linear (checker/linearizable)}))
+                     :model (model/cas-register)}
+   :document-register {:client (document-register-client nil)
+                       :generator (->> (independent/concurrent-generator
+                                        10
+                                        (range)
+                                        (fn [k]
+                                          (->> (gen/mix     [r w])
+                                               (gen/stagger 1/30)
+                                               (gen/limit   300))))
+                                       (gen/nemesis
+                                        (gen/seq (cycle [(gen/sleep 5)
+                                                         {:type :info, :f :start}
+                                                         (gen/sleep 5)
+                                                         {:type :info, :f :stop}])))
+                                       (gen/time-limit 30))
+                       :checker (independent/checker (checker/compose
+                                                      {:timeline (timeline/html)
+                                                       :linear (checker/linearizable)}))
+                       :model (model/register 0)}
+
+   ;; FIXME
+   :document-set {:client nil
+                  :checker (checker/set)
+                  :model (model/set)}})
 
 (defn arangodb-test
   [opts]
   (info :opts opts)
-  (merge tests/noop-test
-         {:name    "arangodb"
-          :os      debian/os
-          :db      (db "3.2.7")
-          :client  (document-client nil)
-          :nemesis (nemesis/partition-random-halves)
-          :model   (model/register 0)
-          :checker (checker/compose
-                    {:perf  (checker/perf)
-                     :indep (independent/checker
-                             (checker/compose
-                              {:timeline (timeline/html)
-                               :linear   (checker/linearizable)}))})
-          :generator (->> (independent/concurrent-generator
-                           10
-                           (range)
-                           (fn [k]
-                             (->> (gen/mix     [r w])
-                                  (gen/stagger 1/30)
-                                  (gen/limit   300))))
-                          (gen/nemesis
-                           (gen/seq (cycle [(gen/sleep 5)
-                                            {:type :info, :f :start}
-                                            (gen/sleep 5)
-                                            {:type :info, :f :stop}])))
-                          (gen/time-limit (:time-limit opts)))}
+  (let [{:keys [generator
+                client
+                checker
+                model]} (get (workloads) (:workload opts))]
+    (merge tests/noop-test
+           opts
+           {:name    (str "arangodb " (name (:workload opts)))
+            :os      debian/os
+            :db      (db "3.2.7")
+            :client  client
+            ; :nemesis (nemesis/partition-random-halves)
+            :model   model
+            :checker (checker/compose
+                      {:perf  (checker/perf)
+                       :workload checker})
+            :generator generator})))
 
-         opts))
+;;;;;
+
+(def opt-spec
+  "Additional command line options"
+  [[nil "--workload WORKLOAD" "Test workload to run, e.g. agency-register"
+    :parse-fn keyword
+    :missing (str "--workload " (cli/one-of (workloads)))
+    :validate [(workloads) (cli/one-of (workloads))]]])
 
 (defn -main
   "Handles command line arguments. Can either run a test, or a web server for
   browsing results."
   [& args]
-  (cli/run! (merge (cli/single-test-cmd {:test-fn arangodb-test})
+  (cli/run! (merge (cli/single-test-cmd {:test-fn arangodb-test
+                                         :opt-spec opt-spec})
                    (cli/serve-cmd))
             args))
