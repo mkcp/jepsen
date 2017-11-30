@@ -12,7 +12,7 @@
              [independent :as independent]
              [nemesis    :as nemesis]
              [tests      :as tests]
-             [util       :refer [timeout]]
+             [util       :refer [timeout meh]]
              [cli :as cli]]
             [jepsen.control.net :as net]
             [jepsen.control.util :as cu]
@@ -25,10 +25,11 @@
             [jepsen.core :as jepsen]))
 
 (def dir "/var/lib/arangodb3")
-(def binary "arangod")
+(def binary "/usr/bin/arangodb")
 (def logfile "/arangod.log")
 (def pidfile "/arangod.pid")
-(def port 8529)
+(def port 8530)
+(def agency-port 8531)
 
 ;; TODO Verify that these aren't used
 (defn peer-addr [node] (str (name node) ":" port))
@@ -57,37 +58,59 @@
        (c/exec :test "-f" (deb-dest version) "||" :wget :-q (deb-src version) :-O (deb-dest version))
        (c/exec :dpkg :-i (deb-dest version))
 
+       ;; TODO Swapping to arangodb bin
        ;; Ensure service stopped
-       (c/exec :service :arangodb3 :stop)
+       ;; (c/exec :service :arangodb3 :stop)
 
        ;; Ensure data directories are clean
-       (c/exec :rm :-rf :/var/lib/arangodb3)
-       (c/exec :mkdir :/var/lib/arangodb3)
-       (c/exec :chown :-R :arangodb :/var/lib/arangodb3)
-       (c/exec :chgrp :-R :arangodb :/var/lib/arangodb3)
+       (c/exec :rm :-rf (keyword dir))
+       (c/exec :mkdir (keyword dir))
+       (c/exec :chown :-R :arangodb (keyword dir))
+       (c/exec :chgrp :-R :arangodb (keyword dir))
 
+       ;; TODO Swapping to arangodb bin, this might change config needs
+       ;; Adjust arangod.conf and write to disk
+       ;; (c/exec :echo (-> "arangod.conf"
+       ;;                   io/resource
+       ;;                   slurp
+       ;;                   (str/replace "$NODE_COUNT" (-> test :nodes count str))
+       ;;                   (str/replace "$NODE_ADDRESS" (net/local-ip)))
+       ;;         :> "/etc/arangodb3/arangod.conf")
+
+       ;; TODO Swapping to arangodb bin
        ;; Run as service
-       (c/exec :echo (-> "arangod.conf"
-                         io/resource
-                         slurp
-                         (str/replace "$NODE_ADDRESS" (net/local-ip)))
-               :> "/etc/arangodb3/arangod.conf")
-       (c/exec :service :arangodb3 :start)
+       ;; (c/exec :service :arangodb3 :start)
 
-       ;; Give cluster time to stabalize. Anything under 30s seems to risk hitting 503s
+       (c/su
+        (cu/start-daemon!
+         {:chdir dir
+          :logfile logfile
+          :pidfile pidfile}
+         binary
+         (when-not (= node "n1")
+           "--starter.join=n1")
+         "--log.verbose=true"
+         (str "--starter.data-dir=" dir)
+         (str "--cluster.agency-size=" (-> test :nodes count))
+         (str "--all.log.file=" logfile)))
+
+       ;; Give cluster time to stabilize. Anything under 30s seems to risk hitting 503s
        (Thread/sleep 30000)))
 
     (teardown! [_ test node]
-      (info node "Tearing down arangodb")
+      (info node "stopping arangodb")
       (c/su
-       (info node "Stopping service arangodb3")
-       (c/exec :service :arangodb3 :stop)
-       (info node "Clearing data directory")
-       (c/exec :rm :-rf :/var/lib/arangodb3)
-       (c/exec :mkdir :/var/lib/arangodb3)
-       (c/exec :chown :-R :arangodb :/var/lib/arangodb3)
-       (c/exec :chgrp :-R :arangodb :/var/lib/arangodb3)
-       (info node "Clearing log directory")
+       (meh (c/exec :killall :-9 :arangodb))
+       (meh (c/exec :killall :-9 :arangod)))
+
+      (c/su
+       #_(info node "Stopping service arangodb3")
+       #_(c/exec :service :arangodb3 :stop)
+       (info node "deleting data files")
+       (c/exec :rm :-rf (keyword dir))
+       (c/exec :mkdir (keyword dir))
+       (c/exec :chown :-R :arangodb (keyword dir))
+       (c/exec :chgrp :-R :arangodb (keyword dir))
        (c/exec :rm :-rf (keyword logfile))))
 
     db/LogFiles
@@ -118,7 +141,7 @@
 
 (defn agency-url
   ([node]   (agency-url node nil))
-  ([node f] (str "http://" node ":" port "/_api/agency/" f)))
+  ([node f] (str "http://" node ":" agency-port "/_api/agency/" f)))
 
 (defn agency-read! [node key]
   (let [url  (agency-url node "read")
@@ -192,12 +215,34 @@
                :redirect-strategy :lax
                :socket-timeout 5000})
 
+;; FIXME condense these functions
 (defn doc-url
   ([node] (str "http://" node ":" port "/_api/document/jepsen/"))
   ([node k] (str "http://" node ":" port "/_api/document/jepsen/" k)))
 
+(defn all-keys-url [node]
+  (str "http://" node ":" port "/_api/simple/all-keys"))
+
+(defn all-docs-url [node]
+  (str "http://" node ":" port "/_api/simple/all"))
+
 (defn collection-url [node]
   (str "http://" node ":" port "/_api/collection/"))
+
+(defn admin-url [node]
+  (str "http://" node ":" port "/_admin/"))
+
+(defn doc-setup-collection! [test node]
+  (try
+    (let [body (json/generate-string {:name              "jepsen"
+                                      :waitForSync       true
+                                      ;:numberOfShards    (count (:nodes test))
+                                      :replicationFactor (count (:nodes test))
+                                      })]
+      (http/post (collection-url node) (assoc doc-opts :body body)))
+    (catch Exception e
+      (when-not (already-exists? e)
+        (throw e)))))
 
 (defn doc-read! [node k]
   (let [url (doc-url node k)]
@@ -226,14 +271,14 @@
 
   (setup! [this test]
     (info "Setting up client for node" node)
+    (doc-setup-collection! test node)
+
+    ;; Print out our collection config
+    #_(println (http/get (str (admin-url node) "cluster_test")))
+
+    ;; Initialize our keyspace. Otherwise we would have to post first then put.
+    ;; TODO Why in the hecky is this returning 409s. Am I not clearing the db properly?
     (try
-      (http/post (collection-url node)
-                 (assoc doc-opts
-                        :body (json/generate-string {:name "jepsen"
-                                                     :waitForSync true
-                                                     :numberOfShards (count (:nodes test))})))
-      (println (http/get (str (collection-url node) "jepsen/properties")))
-      ;; Initialize our keyspace. Otherwise we would have to post first then put.
       (doseq [i (range 0 50)]
         (http/post (doc-url node) (assoc doc-opts :body (json/generate-string {:_key (str i) :value 0}))))
       (catch Exception e
@@ -256,14 +301,13 @@
                      (assoc op :type :ok)
                      (assoc op :type crash :error (pr-str err))))
 
-           :cas (let [#_res #_(doc-cas! node k)]
-                  (assoc op :type :fail :error :not-implemented)))
+          :cas (assoc op :type :fail :error :not-implemented))
 
         (catch Exception e
           (cond
             (not-found? e) (assoc op :type crash :error :not-found)
-            :else                     (do (error (pr-str (.getMessage e)))
-                                          (assoc op :type crash :error :indeterminate)))))))
+            :else          (do (error (pr-str (.getMessage e)))
+                               (assoc op :type crash :error :indeterminate)))))))
 
   ;; HTTP clients are not stateful
   (close! [_ _])
@@ -271,18 +315,53 @@
 
 (defn document-register-client [node] (DocumentClient. node))
 
-;;;;;
+(defn doc-read-all! [node]
+  (let [url  (all-docs-url node)
+        body (json/generate-string {:collection "jepsen"
+                                    :limit 50000})]
+    (http/put url (assoc doc-opts :body body))))
 
+(defn admin-url [node]
+  (str "http://" node ":" port "/_admin/"))
+
+(defn parse-int [s] (Integer. (re-find  #"\d+" s )))
+
+(defn parse-read-all [res]
+  (let [result (-> res :body json/parse-string (get "result"))]
+    (map #(Integer. (get % "_key")) result)))
 
 (defrecord DocumentSetClient [node]
   client/Client
-  (open! [this test node])
-  (setup! [this test])
-  (invoke! [this test op])
+  (open! [this test node]
+    (assoc this :node (name node)))
+
+  (setup! [this test]
+    (info "Setting up client for node" node)
+    #_(warn (http/get (str (admin-url node) "cluster-test") doc-opts))
+    (doc-setup-collection! test node))
+
+  (invoke! [this test op]
+    (let [crash (if (= :read (:f op)) :fail :info)]
+      (try
+        (case (:f op)
+          :add (let [res (http/post (doc-url node)
+                                    (assoc doc-opts :body (json/generate-string {:_key (str (:value op))})))]
+                 (assoc op :type :ok))
+
+          :read (let [res (doc-read-all! node)
+                      v   (parse-read-all res)]
+                  (warn (:body res))
+                  (assoc op :type :ok :value (set v))))
+        (catch Exception e
+          (cond
+            (not-found? e) (assoc op :type crash :error :not-found)
+            :else          (do (error (pr-str (.getMessage e)))
+                               (assoc op :type crash :error :indeterminate)))))))
+
   (close! [this test])
   (teardown! [this test]))
 
-(defn document-set-client [])
+(defn document-set-client [node] (DocumentSetClient. node))
 
 ;;;;;
 
@@ -299,73 +378,86 @@
   this is a function, instead of a constant--we may need a fresh workload if we
   run more than one test."
   []
-  {:agency-register {:client (agency-client nil)
-                     :generator (->> (independent/concurrent-generator
-                                      10
-                                      (range)
-                                      (fn [k]
-                                        (->> (gen/mix     [r w cas])
-                                             (gen/stagger 1/30)
-                                             (gen/limit   300))))
-                                     (gen/nemesis
-                                      (gen/seq (cycle [(gen/sleep 5)
-                                                       {:type :info, :f :start}
-                                                       (gen/sleep 5)
-                                                       {:type :info, :f :stop}])))
-                                     (gen/time-limit 30))
-                     :checker (independent/checker (checker/compose
-                                                    {:timeline (timeline/html)
-                                                     :linear (checker/linearizable)}))
-                     :model (model/cas-register)}
-   :document-register {:client (document-register-client nil)
-                       :generator (->> (independent/concurrent-generator
-                                        10
-                                        (range)
-                                        (fn [k]
-                                          (->> (gen/mix     [r w])
-                                               (gen/stagger 1/30)
-                                               (gen/limit   300))))
-                                       (gen/nemesis
-                                        (gen/seq (cycle [(gen/sleep 5)
-                                                         {:type :info, :f :start}
-                                                         (gen/sleep 5)
-                                                         {:type :info, :f :stop}])))
-                                       (gen/time-limit 30))
-                       :checker (independent/checker (checker/compose
-                                                      {:timeline (timeline/html)
-                                                       :linear (checker/linearizable)}))
-                       :model (model/register 0)}
+  {:agency {:client (agency-client nil)
+            :generator (->> (independent/concurrent-generator
+                             10
+                             (range)
+                             (fn [k]
+                               (->> (gen/mix     [r w cas])
+                                    (gen/stagger 1/30)
+                                    (gen/limit   300)))))
+            :checker (independent/checker (checker/compose
+                                           {:timeline (timeline/html)
+                                            :linear (checker/linearizable)}))
+            :model (model/cas-register)}
 
-   ;; FIXME
-   :document-set {:client nil
-                  :checker (checker/set)
-                  :model (model/set)}})
+   :document-cas {:client (document-register-client nil)
+                  :generator (->> (independent/concurrent-generator
+                                   10
+                                   (range)
+                                   (fn [k]
+                                     (->> (gen/mix     [r w])
+                                          (gen/stagger 1/30)
+                                          (gen/limit   300)))))
+                  :checker (independent/checker (checker/compose
+                                                 {:timeline (timeline/html)
+                                                  :linear (checker/linearizable)}))
+                  :model (model/register 0)}
+
+   :document-insert {:client (document-set-client nil)
+                     :generator (->> (range)
+                                     (map (fn [x] {:type :invoke
+                                                   :f    :add
+                                                   :value x}))
+                                     gen/seq
+                                     (gen/stagger 1/10))
+                     :final-generator (->> {:type :invoke, :f :read}
+                                           gen/once
+                                           gen/each)
+                     :checker (checker/set)
+                     :model (model/set)}
+
+   ;; TODO
+   :document-revision {:client (document-register-client nil)}})
 
 (defn arangodb-test
   [opts]
   (info :opts opts)
   (let [{:keys [generator
+                final-generator
                 client
                 checker
-                model]} (get (workloads) (:workload opts))]
+                model]} (get (workloads) (:workload opts))
+        generator (->> generator
+                       (gen/nemesis (gen/start-stop 30 15))
+                       (gen/time-limit (:time-limit opts)))
+        generator (if-not final-generator
+                    generator
+                    (gen/phases generator
+                                (gen/log "Healing cluster")
+                                (gen/nemesis
+                                 (gen/once {:type :info, :f :stop}))
+                                (gen/log "Waiting for quiescence")
+                                (gen/sleep 30)
+                                (gen/clients final-generator)))]
     (merge tests/noop-test
            opts
            {:name    (str "arangodb " (name (:workload opts)))
             :os      debian/os
             :db      (db "3.2.7")
             :client  client
-            ; :nemesis (nemesis/partition-random-halves)
+            ;:nemesis (nemesis/partition-random-halves)
+            :generator generator
             :model   model
             :checker (checker/compose
                       {:perf  (checker/perf)
-                       :workload checker})
-            :generator generator})))
+                       :workload checker})})))
 
 ;;;;;
 
 (def opt-spec
   "Additional command line options"
-  [[nil "--workload WORKLOAD" "Test workload to run, e.g. agency-register"
+  [[nil "--workload WORKLOAD" "Test workload to run, e.g. agency"
     :parse-fn keyword
     :missing (str "--workload " (cli/one-of (workloads)))
     :validate [(workloads) (cli/one-of (workloads))]]])
