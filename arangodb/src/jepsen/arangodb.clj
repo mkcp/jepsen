@@ -12,7 +12,7 @@
              [independent :as independent]
              [nemesis    :as nemesis]
              [tests      :as tests]
-             [util       :refer [timeout meh]]
+             [util       :refer [timeout meh pprint-str]]
              [cli :as cli]]
             [jepsen.control.net :as net]
             [jepsen.control.util :as cu]
@@ -26,29 +26,25 @@
 
 (def dir "/var/lib/arangodb3")
 (def binary "/usr/bin/arangodb")
-(def logfile "/arangod.log")
-(def pidfile "/arangod.pid")
-(def port 8530)
+(def log-file "/arangod.log")
+(def pid-file "/arangod.pid")
+(def coordinator-port 8529)
+(def db-port 8530)
 (def agency-port 8531)
-
-;; TODO Verify that these aren't used
-(defn peer-addr [node] (str (name node) ":" port))
-(defn addr      [node] (str (name node) ":" port))
-(defn cluster-info [node] (str (name node) "=http://" (name node) ":" port))
 
 (defn deb-src [version]
   (str "https://download.arangodb.com/arangodb32/Debian_8.0/amd64/arangodb3-" version "-1_amd64.deb"))
 
 (defn deb-dest [version] (str "arangodb3-" version "-1_amd64.deb"))
 
-(defn db [version]
+(defn db [version storage-engine]
   (reify db/DB
     (setup! [_ test node]
       (c/su
        (info node "Installing arangodb" version)
 
        ;; Deps
-       (c/exec :apt-get :install "-y" "-qq" (str "libjemalloc1"))
+       (c/exec :apt-get :install "-y" "-qq" "libjemalloc1")
 
        ;; Password stuff?
        (c/exec :echo :arangodb3 "arangodb3/password" "password" "" "|" :debconf-set-selections)
@@ -58,67 +54,51 @@
        (c/exec :test "-f" (deb-dest version) "||" :wget :-q (deb-src version) :-O (deb-dest version))
        (c/exec :dpkg :-i (deb-dest version))
 
-       ;; TODO Swapping to arangodb bin
-       ;; Ensure service stopped
-       ;; (c/exec :service :arangodb3 :stop)
-
        ;; Ensure data directories are clean
        (c/exec :rm :-rf (keyword dir))
        (c/exec :mkdir (keyword dir))
        (c/exec :chown :-R :arangodb (keyword dir))
        (c/exec :chgrp :-R :arangodb (keyword dir))
 
-       ;; TODO Swapping to arangodb bin, this might change config needs
-       ;; Adjust arangod.conf and write to disk
-       ;; (c/exec :echo (-> "arangod.conf"
-       ;;                   io/resource
-       ;;                   slurp
-       ;;                   (str/replace "$NODE_COUNT" (-> test :nodes count str))
-       ;;                   (str/replace "$NODE_ADDRESS" (net/local-ip)))
-       ;;         :> "/etc/arangodb3/arangod.conf")
-
-       ;; TODO Swapping to arangodb bin
-       ;; Run as service
-       ;; (c/exec :service :arangodb3 :start)
-
        (c/su
         (cu/start-daemon!
          {:chdir dir
-          :logfile logfile
-          :pidfile pidfile}
+          :logfile log-file
+          :pidfile pid-file}
          binary
          (when-not (= node "n1")
            "--starter.join=n1")
          "--log.verbose=true"
-         (str "--starter.data-dir=" dir)
+         ; TODO Seems to be ignoring data-dir, confirm
+         #_(str "--starter.data-dir=" dir)
+         (str "--server.storage-engine=" storage-engine)
          (str "--cluster.agency-size=" (-> test :nodes count))
-         (str "--all.log.file=" logfile)))
+         (str "--all.log.file=" log-file)))
 
-       ;; Give cluster time to stabilize. Anything under 30s seems to risk hitting 503s
+       ;; Give cluster time to stabilize. Anything under 30s seems to risk
+       ;; hitting 503s in the agency test
        (Thread/sleep 30000)))
 
     (teardown! [_ test node]
-      (info node "stopping arangodb")
       (c/su
+       (info node "stopping arangodb")
        (meh (c/exec :killall :-9 :arangodb))
-       (meh (c/exec :killall :-9 :arangod)))
+       (meh (c/exec :killall :-9 :arangod))
 
-      (c/su
-       #_(info node "Stopping service arangodb3")
-       #_(c/exec :service :arangodb3 :stop)
        (info node "deleting data files")
        (c/exec :rm :-rf (keyword dir))
        (c/exec :mkdir (keyword dir))
        (c/exec :chown :-R :arangodb (keyword dir))
        (c/exec :chgrp :-R :arangodb (keyword dir))
-       (c/exec :rm :-rf (keyword logfile))))
+       (c/exec :rm :-rf (keyword log-file))))
 
     db/LogFiles
     (log-files [_ test node]
-      [logfile])))
+      [log-file])))
 
 ;;;;;
 
+;; TODO with-errors macro for http client invokes
 (defn unavailable?    [e] (->> e .getMessage (re-find #"503") some?))
 (defn precond-fail?   [e] (->> e .getMessage (re-find #"412") some?))
 (defn read-timed-out? [e] (->> e .getMessage (re-find #"Read timed out") some?))
@@ -217,27 +197,27 @@
 
 ;; FIXME condense these functions
 (defn doc-url
-  ([node] (str "http://" node ":" port "/_api/document/jepsen/"))
-  ([node k] (str "http://" node ":" port "/_api/document/jepsen/" k)))
+  ([node] (str "http://" node ":" db-port "/_api/document/jepsen/"))
+  ([node k] (str "http://" node ":" db-port "/_api/document/jepsen/" k)))
 
 (defn all-keys-url [node]
-  (str "http://" node ":" port "/_api/simple/all-keys"))
+  (str "http://" node ":" db-port "/_api/simple/all-keys"))
 
 (defn all-docs-url [node]
-  (str "http://" node ":" port "/_api/simple/all"))
+  (str "http://" node ":" db-port "/_api/simple/all"))
 
 (defn collection-url [node]
-  (str "http://" node ":" port "/_api/collection/"))
+  (str "http://" node ":" db-port "/_api/collection/"))
 
 (defn admin-url [node]
-  (str "http://" node ":" port "/_admin/"))
+  (str "http://" node ":" db-port "/_admin/"))
 
 (defn doc-setup-collection! [test node]
   (try
     (let [body (json/generate-string {:name              "jepsen"
                                       :waitForSync       true
                                       ;:numberOfShards    (count (:nodes test))
-                                      :replicationFactor (count (:nodes test))
+                                      ;:replicationFactor (count (:nodes test))
                                       })]
       (http/post (collection-url node) (assoc doc-opts :body body)))
     (catch Exception e
@@ -322,7 +302,7 @@
     (http/put url (assoc doc-opts :body body))))
 
 (defn admin-url [node]
-  (str "http://" node ":" port "/_admin/"))
+  (str "http://" node ":" db-port "/_admin/"))
 
 (defn parse-int [s] (Integer. (re-find  #"\d+" s )))
 
@@ -346,6 +326,7 @@
         (case (:f op)
           :add (let [res (http/post (doc-url node)
                                     (assoc doc-opts :body (json/generate-string {:_key (str (:value op))})))]
+                 (warn (pprint-str res))
                  (assoc op :type :ok))
 
           :read (let [res (doc-read-all! node)
@@ -391,18 +372,18 @@
                                             :linear (checker/linearizable)}))
             :model (model/cas-register)}
 
-   :document-cas {:client (document-register-client nil)
-                  :generator (->> (independent/concurrent-generator
-                                   10
-                                   (range)
-                                   (fn [k]
-                                     (->> (gen/mix     [r w])
-                                          (gen/stagger 1/30)
-                                          (gen/limit   300)))))
-                  :checker (independent/checker (checker/compose
-                                                 {:timeline (timeline/html)
-                                                  :linear (checker/linearizable)}))
-                  :model (model/register 0)}
+   :document-rw {:client (document-register-client nil)
+                 :generator (->> (independent/concurrent-generator
+                                  10
+                                  (range)
+                                  (fn [k]
+                                    (->> (gen/mix     [r w])
+                                         (gen/stagger 1/30)
+                                         (gen/limit   300)))))
+                 :checker (independent/checker (checker/compose
+                                                {:timeline (timeline/html)
+                                                 :linear (checker/linearizable)}))
+                 :model (model/register 0)}
 
    :document-insert {:client (document-set-client nil)
                      :generator (->> (range)
@@ -429,7 +410,7 @@
                 checker
                 model]} (get (workloads) (:workload opts))
         generator (->> generator
-                       (gen/nemesis (gen/start-stop 30 15))
+                       (gen/nemesis (gen/start-stop 10 10))
                        (gen/time-limit (:time-limit opts)))
         generator (if-not final-generator
                     generator
@@ -442,16 +423,16 @@
                                 (gen/clients final-generator)))]
     (merge tests/noop-test
            opts
-           {:name    (str "arangodb " (name (:workload opts)))
-            :os      debian/os
-            :db      (db "3.2.7")
-            :client  client
-            ;:nemesis (nemesis/partition-random-halves)
+           {:name      (str "arangodb " (name (:workload opts)))
+            :os        debian/os
+            :db        (db "3.2.9" "auto")
+            :client    client
+            :nemesis   (nemesis/partition-random-halves)
             :generator generator
-            :model   model
-            :checker (checker/compose
-                      {:perf  (checker/perf)
-                       :workload checker})})))
+            :model     model
+            :checker   (checker/compose
+                        {:perf  (checker/perf)
+                         :workload checker})})))
 
 ;;;;;
 
