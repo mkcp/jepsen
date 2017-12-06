@@ -28,8 +28,9 @@
 (def binary "/usr/bin/arangodb")
 (def log-file "/arangod.log")
 (def pid-file "/arangod.pid")
-(def coordinator-port 8529)
-(def db-port 8530)
+
+(def db-port 8529) ;; coordinator
+(def dbserver-port 8530)
 (def agency-port 8531)
 
 (defn deb-src [version]
@@ -37,22 +38,26 @@
 
 (defn deb-dest [version] (str "arangodb3-" version "-1_amd64.deb"))
 
-(defn db [version storage-engine]
+(defn db [version storage-engine install-deb?]
   (reify db/DB
     (setup! [_ test node]
       (c/su
        (info node "Installing arangodb" version)
 
-       ;; Deps
-       (c/exec :apt-get :install "-y" "-qq" "libjemalloc1")
+       ;; TODO Installation non-idempotency... woooooo spooky! (could caused by docker? permissions?)
+       ;; For some reason the /etc/arangodb3 config changes, removing auto from server.storage-engine.
+       ;; This break the dpkg
+       (when install-deb?
+         ;; Deps
+         (c/exec :apt-get :install "-y" "-qq" "libjemalloc1")
 
-       ;; Password stuff?
-       (c/exec :echo :arangodb3 "arangodb3/password" "password" "" "|" :debconf-set-selections)
-       (c/exec :echo :arangodb3 "arangodb3/password_again" "password" "" "|" :debconf-set-selections)
+         ;; Password stuff?
+         (c/exec :echo :arangodb3 "arangodb3/password" "password" "" "|" :debconf-set-selections)
+         (c/exec :echo :arangodb3 "arangodb3/password_again" "password" "" "|" :debconf-set-selections)
 
-       ;; Download & install
-       (c/exec :test "-f" (deb-dest version) "||" :wget :-q (deb-src version) :-O (deb-dest version))
-       (c/exec :dpkg :-i (deb-dest version))
+         ;; Download & install
+         (c/exec :test "-f" (deb-dest version) "||" :wget :-q (deb-src version) :-O (deb-dest version))
+         (c/exec :dpkg :-i (deb-dest version)))
 
        ;; Ensure data directories are clean
        (c/exec :rm :-rf (keyword dir))
@@ -77,7 +82,7 @@
 
        ;; Give cluster time to stabilize. Anything under 30s seems to risk
        ;; hitting 503s in the agency test
-       (Thread/sleep 30000)))
+       (Thread/sleep 60000)))
 
     (teardown! [_ test node]
       (c/su
@@ -113,11 +118,11 @@
 
 ;;;;;
 
-(def http-opts {:conn-timeout 5000
+(def http-opts {:conn-timeout 30000
                 :content-type :json
                 :trace-redirects true
                 :redirect-strategy :lax
-                :socket-timeout 5000})
+                :socket-timeout 30000})
 
 (defn agency-url
   ([node]   (agency-url node nil))
@@ -189,7 +194,7 @@
 
 ;;;;;
 
-(def doc-opts {:conn-timeout 5000
+(def doc-opts {:conn-timeout 25000
                :content-type :json
                :trace-redirects true
                :redirect-strategy :lax
@@ -216,10 +221,14 @@
   (try
     (let [body (json/generate-string {:name              "jepsen"
                                       :waitForSync       true
-                                      ;:numberOfShards    (count (:nodes test))
-                                      ;:replicationFactor (count (:nodes test))
+                                      :numberOfShards    (count (:nodes test))
+                                      :replicationFactor (count (:nodes test))
                                       })]
       (http/post (collection-url node) (assoc doc-opts :body body)))
+
+    (catch java.net.SocketTimeoutException _
+      (warn "Timeout occurred during collection setup, continuing anyway..."))
+
     (catch Exception e
       (when-not (already-exists? e)
         (throw e)))))
@@ -256,10 +265,9 @@
     ;; Print out our collection config
     #_(println (http/get (str (admin-url node) "cluster_test")))
 
-    ;; Initialize our keyspace. Otherwise we would have to post first then put.
-    ;; TODO Why in the hecky is this returning 409s. Am I not clearing the db properly?
+    ;; Initialize our keyspace so we don't have to init each new key during invokes.
     (try
-      (doseq [i (range 0 50)]
+      (doseq [i (range 0 100)]
         (http/post (doc-url node) (assoc doc-opts :body (json/generate-string {:_key (str i) :value 0}))))
       (catch Exception e
         (when-not (already-exists? e)
@@ -326,12 +334,11 @@
         (case (:f op)
           :add (let [res (http/post (doc-url node)
                                     (assoc doc-opts :body (json/generate-string {:_key (str (:value op))})))]
-                 (warn (pprint-str res))
                  (assoc op :type :ok))
 
           :read (let [res (doc-read-all! node)
                       v   (parse-read-all res)]
-                  (warn (:body res))
+                  (warn res)
                   (assoc op :type :ok :value (set v))))
         (catch Exception e
           (cond
@@ -425,7 +432,7 @@
            opts
            {:name      (str "arangodb " (name (:workload opts)))
             :os        debian/os
-            :db        (db "3.2.9" "auto")
+            :db        (db "3.2.9" "auto" (:install-deb? opts))
             :client    client
             :nemesis   (nemesis/partition-random-halves)
             :generator generator
@@ -441,7 +448,11 @@
   [[nil "--workload WORKLOAD" "Test workload to run, e.g. agency"
     :parse-fn keyword
     :missing (str "--workload " (cli/one-of (workloads)))
-    :validate [(workloads) (cli/one-of (workloads))]]])
+    :validate [(workloads) (cli/one-of (workloads))]]
+   ;; TODO Shouldn't need this. Is it a bug in the env or in the deb?
+   [nil "--install-deb? true/false" "Run dpkg installation during DB step? Workaround for repeated installs failing."
+    :parse-fn #{"true"}
+    :missing (str "--install-deb? " false)]])
 
 (defn -main
   "Handles command line arguments. Can either run a test, or a web server for
