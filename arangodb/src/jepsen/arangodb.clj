@@ -219,20 +219,25 @@
   (str "http://" node ":" db-port "/_admin/"))
 
 (defn doc-setup-collection! [test node]
-  (try
-    (let [body (json/generate-string {:name              "jepsen"
-                                      :waitForSync       true
-                                      :numberOfShards    (count (:nodes test))
-                                      :replicationFactor (count (:nodes test))
-                                      })]
-      (http/post (collection-url node) (assoc doc-opts :body body)))
+  (let [body (json/generate-string {:name              "jepsen"
+                                    :waitForSync       true
+                                    ;:numberOfShards    (count (:nodes test))
+                                    :replicationFactor (count (:nodes test))})]
+    (http/post (collection-url node) (assoc doc-opts :body body))))
 
-    (catch java.net.SocketTimeoutException _
-      (warn "Timeout occurred during collection setup, continuing anyway..."))
+(defn init-keyspace!
+  "Creates keys with value 0 in our collection. The number of keys is 10 times the
+  concurrency value passed to the test. This isn't perfect because very long tests might
+  go past and run into errors."
+  [test node]
+  (let [max (* 10 (:concurrency test))
+        t   (mapv (fn [i] {:_key (str i) :value 0})
+                  (range 0 max))
+        body (json/generate-string t)]
+    (http/post (doc-url node) (assoc doc-opts :body body))))
 
-    (catch Exception e
-      (when-not (already-exists? e)
-        (throw e)))))
+(defn cluster-test! [node]
+  (http/get (str (admin-url node) "cluster_test")))
 
 (defn doc-read! [node k]
   (let [url (doc-url node k)]
@@ -260,16 +265,13 @@
     (assoc this :node (name node)))
 
   (setup! [this test]
-    (info "Setting up client for node" node)
-    (doc-setup-collection! test node)
-
-    ;; Print out our collection config
-    #_(println (http/get (str (admin-url node) "cluster_test")))
-
-    ;; Initialize our keyspace so we don't have to init each new key during invokes.
     (try
-      (doseq [i (range 0 100)]
-        (http/post (doc-url node) (assoc doc-opts :body (json/generate-string {:_key (str i) :value 0}))))
+      (info "Setting up client for node" node)
+      (doc-setup-collection! test node)
+      (init-keyspace! test node)
+
+      (catch java.net.SocketTimeoutException _
+        (warn "Timeout occurred during collection setup, continuing anyway..."))
       (catch Exception e
         (when-not (already-exists? e)
           (throw e)))))
@@ -292,11 +294,15 @@
 
           :cas (assoc op :type :fail :error :not-implemented))
 
+        (catch java.net.SocketTimeoutException e
+          (assoc op :type crash :error :timeout))
+
         (catch Exception e
           (cond
-            (not-found? e) (assoc op :type crash :error :not-found)
-            :else          (do (error (pr-str (.getMessage e)))
-                               (assoc op :type crash :error :indeterminate)))))))
+            (not-found? e)      (assoc op :type crash :error :not-found)
+            (internal-error? e) (assoc op :type crash :error :server-500)
+            :else               (do (error (pr-str (.getMessage e)))
+                                    (assoc op :type crash :error :indeterminate)))))))
 
   ;; HTTP clients are not stateful
   (close! [_ _])
@@ -319,6 +325,9 @@
   (let [result (-> res :body json/parse-string (get "result"))]
     (map #(Integer. (get % "_key")) result)))
 
+;; FIXME Not a valid test if the keyspace exceeds 1000. Adjusting the limit doesn't increase entries past 1k
+;;       but it looks like it might return a cursor, so if the read client can traverse that and merge the
+;;       return set then we might have a stew baby
 (defrecord DocumentSetClient [node]
   client/Client
   (open! [this test node]
@@ -326,8 +335,14 @@
 
   (setup! [this test]
     (info "Setting up client for node" node)
-    #_(warn (http/get (str (admin-url node) "cluster-test") doc-opts))
-    (doc-setup-collection! test node))
+    (try
+      (doc-setup-collection! test node)
+
+      (catch java.net.SocketTimeoutException _
+        (warn "Timeout occurred during collection setup, continuing anyway..."))
+      (catch Exception e
+        (when-not (already-exists? e)
+          (throw e)))))
 
   (invoke! [this test op]
     (let [crash (if (= :read (:f op)) :fail :info)]
@@ -339,7 +354,7 @@
 
           :read (let [res (doc-read-all! node)
                       v   (parse-read-all res)]
-                  (warn res)
+                  (warn "results count:" (count v))
                   (assoc op :type :ok :value (set v))))
         (catch Exception e
           (cond
