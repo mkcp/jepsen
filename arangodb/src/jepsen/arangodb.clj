@@ -44,9 +44,9 @@
       (c/su
        (info node "Installing arangodb" version)
 
-       ;; TODO Installation non-idempotency... woooooo spooky! (could caused by docker? permissions?)
+       ;; TODO Installation non-idempotency... woo spooky! (could caused by docker? permissions?)
        ;; For some reason the /etc/arangodb3 config changes, removing auto from server.storage-engine.
-       ;; This break the dpkg
+       ;; This kills the dpkg (like, really kills, you can't even run other installs.)
        (when install-deb?
          ;; Deps
          (c/exec :apt-get :install "-y" "-qq" "libjemalloc1")
@@ -74,15 +74,15 @@
          (when-not (= node "n1")
            "--starter.join=n1")
          "--log.verbose=true"
-         ; TODO Seems to be ignoring data-dir, confirm
-         #_(str "--starter.data-dir=" dir)
          (str "--server.storage-engine=" storage-engine)
          (str "--cluster.agency-size=" (-> test :nodes count))
          (str "--all.log.file=" log-file)))
 
-       ;; Give cluster time to stabilize. Anything under 30s seems to risk
-       ;; hitting 503s in the agency test
-       (Thread/sleep 60000)))
+       ;; Give cluster time to stabilize.
+       ;; Anything under 30s seems to risk hitting 503s in the agency test.
+       ;; Anything under a minute risks 503s during setup in doc tests.
+       ;; Going with 90 to be safe
+       (Thread/sleep 90000)))
 
     (teardown! [_ test node]
       (c/su
@@ -104,11 +104,12 @@
 ;;;;;
 
 ;; TODO with-errors macro for http client invokes
-(defn unavailable?    [e] (->> e .getMessage (re-find #"503") some?))
-(defn precond-fail?   [e] (->> e .getMessage (re-find #"412") some?))
-(defn read-timed-out? [e] (->> e .getMessage (re-find #"Read timed out") some?))
-(defn already-exists? [e] (->> e .getMessage (re-find #"409") some?))
 (defn not-found?      [e] (->> e .getMessage (re-find #"404") some?))
+(defn already-exists? [e] (->> e .getMessage (re-find #"409") some?))
+(defn precond-fail?   [e] (->> e .getMessage (re-find #"412") some?))
+(defn internal-error? [e] (->> e .getMessage (re-find #"500") some?))
+(defn unavailable?    [e] (->> e .getMessage (re-find #"503") some?))
+(defn read-timed-out? [e] (->> e .getMessage (re-find #"Read timed out") some?))
 
 ;;;;;
 
@@ -118,11 +119,11 @@
 
 ;;;;;
 
-(def http-opts {:conn-timeout 30000
+(def http-opts {:conn-timeout 5000
                 :content-type :json
                 :trace-redirects true
                 :redirect-strategy :lax
-                :socket-timeout 30000})
+                :socket-timeout 5000})
 
 (defn agency-url
   ([node]   (agency-url node nil))
@@ -194,11 +195,11 @@
 
 ;;;;;
 
-(def doc-opts {:conn-timeout 25000
+(def doc-opts {:conn-timeout 30000
                :content-type :json
                :trace-redirects true
                :redirect-strategy :lax
-               :socket-timeout 5000})
+               :socket-timeout 30000})
 
 ;; FIXME condense these functions
 (defn doc-url
@@ -417,7 +418,7 @@
                 checker
                 model]} (get (workloads) (:workload opts))
         generator (->> generator
-                       (gen/nemesis (gen/start-stop 10 10))
+                       (gen/nemesis (gen/start-stop 30 15)) ;; Alternative hits: 20 10
                        (gen/time-limit (:time-limit opts)))
         generator (if-not final-generator
                     generator
@@ -453,6 +454,8 @@
    [nil "--install-deb? true/false" "Run dpkg installation during DB step? Workaround for repeated installs failing."
     :parse-fn #{"true"}
     :missing (str "--install-deb? " false)]])
+
+;; Example run: lein run test --concurrency 50 --workload document-rw --install-deb? false --time-limit 240
 
 (defn -main
   "Handles command line arguments. Can either run a test, or a web server for
