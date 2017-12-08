@@ -103,6 +103,8 @@
 
 ;;;;;
 
+;; HTTP exception classifiers
+
 ;; TODO with-errors macro for http client invokes
 (defn not-found?      [e] (->> e .getMessage (re-find #"404") some?))
 (defn already-exists? [e] (->> e .getMessage (re-find #"409") some?))
@@ -221,7 +223,7 @@
 (defn doc-setup-collection! [test node]
   (let [body (json/generate-string {:name              "jepsen"
                                     :waitForSync       true
-                                    ;:numberOfShards    (count (:nodes test))
+                                    :numberOfShards    (count (:nodes test))
                                     :replicationFactor (count (:nodes test))})]
     (http/post (collection-url node) (assoc doc-opts :body body))))
 
@@ -299,6 +301,7 @@
 
         (catch Exception e
           (cond
+            (read-timed-out? e) (assoc op :type crash :error :read-timed-out)
             (not-found? e)      (assoc op :type crash :error :not-found)
             (internal-error? e) (assoc op :type crash :error :server-500)
             :else               (do (error (pr-str (.getMessage e)))
@@ -313,7 +316,7 @@
 (defn doc-read-all! [node]
   (let [url  (all-docs-url node)
         body (json/generate-string {:collection "jepsen"
-                                    :limit 50000})]
+                                    :batchSize 50000})]
     (http/put url (assoc doc-opts :body body))))
 
 (defn admin-url [node]
@@ -358,9 +361,12 @@
                   (assoc op :type :ok :value (set v))))
         (catch Exception e
           (cond
-            (not-found? e) (assoc op :type crash :error :not-found)
-            :else          (do (error (pr-str (.getMessage e)))
-                               (assoc op :type crash :error :indeterminate)))))))
+            (read-timed-out? e) (assoc op :type crash :error :read-timed-out)
+            (internal-error? e) (assoc op :type crash :error :server-500)
+            (already-exists? e) (assoc op :type crash :error :already-exists)
+            (not-found? e)      (assoc op :type crash :error :not-found)
+            :else               (do (error (pr-str (.getMessage e)))
+                                    (assoc op :type crash :error :indeterminate)))))))
 
   (close! [this test])
   (teardown! [this test]))
@@ -395,20 +401,7 @@
                                             :linear (checker/linearizable)}))
             :model (model/cas-register)}
 
-   :document-rw {:client (document-register-client nil)
-                 :generator (->> (independent/concurrent-generator
-                                  10
-                                  (range)
-                                  (fn [k]
-                                    (->> (gen/mix     [r w])
-                                         (gen/stagger 1/30)
-                                         (gen/limit   300)))))
-                 :checker (independent/checker (checker/compose
-                                                {:timeline (timeline/html)
-                                                 :linear (checker/linearizable)}))
-                 :model (model/register 0)}
-
-   :document-insert {:client (document-set-client nil)
+   :doc-http-insert {:client (document-set-client nil)
                      :generator (->> (range)
                                      (map (fn [x] {:type :invoke
                                                    :f    :add
@@ -422,7 +415,20 @@
                      :model (model/set)}
 
    ;; TODO
-   :document-revision {:client (document-register-client nil)}})
+   :doc-http-revision {:client (document-register-client nil)}
+
+   :doc-http-register {:client (document-register-client nil)
+                       :generator (->> (independent/concurrent-generator
+                                        10
+                                        (range)
+                                        (fn [k]
+                                          (->> (gen/mix     [r w])
+                                               (gen/stagger 1/30)
+                                               (gen/limit   300)))))
+                       :checker (independent/checker (checker/compose
+                                                      {:timeline (timeline/html)
+                                                       :linear (checker/linearizable)}))
+                       :model (model/register 0)}})
 
 (defn arangodb-test
   [opts]
@@ -433,7 +439,7 @@
                 checker
                 model]} (get (workloads) (:workload opts))
         generator (->> generator
-                       (gen/nemesis (gen/start-stop 30 15)) ;; Alternative hits: 20 10
+                       (gen/nemesis (gen/start-stop 30 20)) ;; Alternative hits: 20 10
                        (gen/time-limit (:time-limit opts)))
         generator (if-not final-generator
                     generator
