@@ -33,6 +33,8 @@
 (def dbserver-port 8530)
 (def agency-port 8531)
 
+(def status-codes (atom #{}))
+
 (defn deb-src [version]
   (str "https://download.arangodb.com/arangodb32/Debian_8.0/amd64/arangodb3-" version "-1_amd64.deb"))
 
@@ -119,7 +121,7 @@
      ~@body
      (catch java.net.SocketTimeoutException e#
        (let [crash# (if (= :read (:f ~op)) :fail :info)]
-         (assoc ~op :type crash# :error :timeout)))
+         (assoc ~op :type crash# :error :socket-timeout)))
      (catch Exception e#
        (let [crash# (if (= :read (:f ~op)) :fail :info)]
          (cond
@@ -313,30 +315,58 @@
           (throw e)))))
 
   (invoke! [this test op]
-    (let [crash (if (= :read (:f op)) :fail :info)]
-      (try
-        (case (:f op)
-          :add (let [res (http/post (doc-url node)
-                                    (assoc doc-opts :body (json/generate-string {:_key (str (:value op))})))]
-                 (assoc op :type :ok))
+    (with-errors op
+      (case (:f op)
+        :add (let [res (http/post (doc-url node)
+                                  (assoc doc-opts :body (json/generate-string {:_key (str (:value op))})))]
+               (swap! status-codes conj (:status res))
+               (assoc op :type :ok))
 
-          :read (let [res (doc-read-all! node)
-                      v   (parse-read-all res)]
-                  (warn "results count:" (count v))
-                  (assoc op :type :ok :value (set v))))
-        (catch Exception e
-          (cond
-            (read-timed-out? e) (assoc op :type crash :error :read-timed-out)
-            (internal-error? e) (assoc op :type crash :error :server-500)
-            (already-exists? e) (assoc op :type crash :error :already-exists)
-            (not-found? e)      (assoc op :type crash :error :not-found)
-            :else               (do (error (pr-str (.getMessage e)))
-                                    (assoc op :type crash :error :indeterminate)))))))
+        :read (let [v (-> node read-all! read-all->ints set)]
+                (assoc op :type :ok :value v)))))
+
+  (close! [this test])
+  (teardown! [this test]
+    (debug "Statuses" (pprint-str @status-codes))))
+
+(defn document-set-client [node] (DocumentSetClient. node))
+
+(defrecord DocHTTPRevisionClient [node revisions]
+  client/Client
+  (open! [this test node]
+    (assoc this :node (name node)))
+
+  (setup! [this test]
+    (info "Setting up client for node" node)
+    (try
+      (doc-setup-collection! test node)
+      ;; TODO We throw away our first revision... that's maybe not great!
+      (http/post (doc-url node)
+                 (assoc doc-opts :body (json/generate-string {:_key "0"})))
+      (catch java.net.SocketTimeoutException _
+        (warn "Timeout occurred during collection setup, continuing anyway..."))
+      (catch Exception e
+        (when-not (already-exists? e)
+          (throw e)))))
+
+  (invoke! [this test op]
+    (with-errors op
+      (assert (= (:f op) :generate))
+      (let [body (json/generate-string {:value "0"})
+            res  (http/put (doc-url node "0") (assoc doc-opts :body body))
+            rev  (-> res :body json/parse-string (get "_rev"))]
+        (assoc op :type :ok :value rev))))
 
   (close! [this test])
   (teardown! [this test]))
 
-(defn document-set-client [node] (DocumentSetClient. node))
+(defn doc-http-revision-client [node revisions] (DocHTTPRevisionClient. node revisions))
+
+;;;;;
+
+(defn r   [_ _] {:type :invoke :f :read  :value nil})
+(defn w   [_ _] {:type :invoke :f :write :value (rand-int 5)})
+(defn cas [_ _] {:type :invoke :f :cas   :value [(rand-int 5) (rand-int 5)]})
 
 ;;;;;
 
@@ -379,9 +409,6 @@
                      :checker (checker/set)
                      :model (model/set)}
 
-   ;; TODO
-   :doc-http-revision {:client (document-register-client nil)}
-
    :doc-http-register {:client (document-register-client nil)
                        :generator (->> (independent/concurrent-generator
                                         10
@@ -393,7 +420,11 @@
                        :checker (independent/checker (checker/compose
                                                       {:timeline (timeline/html)
                                                        :linear (checker/linearizable)}))
-                       :model (model/register 0)}})
+                       :model (model/register 0)}
+
+   :doc-http-revision {:client (doc-http-revision-client nil nil)
+                       :generator {:type :invoke, :f :generate}
+                       :checker (checker/unique-ids)}})
 
 (defn arangodb-test
   [opts]
