@@ -135,7 +135,7 @@
 ;;;;;
 
 ;; HTTP exception classifiers
-
+;; TODO Lots of duplication here, can probably be simplified
 (defn invalid-body?     [e] (->> e .getMessage (re-find #"400") some?))
 (defn not-found?        [e] (->> e .getMessage (re-find #"404") some?))
 (defn already-exists?   [e] (->> e .getMessage (re-find #"409") some?))
@@ -144,13 +144,33 @@
 (defn unavailable?      [e] (->> e .getMessage (re-find #"503") some?))
 (defn client-timed-out? [e] (->> e .getMessage (re-find #"Read timed out") some?))
 
+#_(defn http-errors
+  "Takes a crash type for the current op, and return a mapping of its error patterns to
+  crash type and error message."
+  [crash]
+  {"400"            [:fail :key-not-found]
+   "404"            [:fail :already-exists]
+   "409"            [:fail :precondition-fail]
+   "412"            [:fail :invalid-body]
+   "500"            [crash :server-500]
+   "503"            [crash :node-unavailable]
+   "Read timed out" [crash :client-timeout]})
+
+#_(let [crash        (if (= :read (:f op)) :fail :info)
+      errors       (http-errors crash)
+      message      (let [matchers (map re-pattern (keys errors))]
+                     (->> e .getMessage (map re-find matchers) first first))
+      ;; If we don't find an error, return :indeterminate
+      [type error] (get errors message [crash :indeterminate])]
+  (assoc op :type type :error message))
+
 (defmacro with-errors
   [op & body]
   `(try
      ~@body
      (catch java.net.SocketTimeoutException e#
        (let [crash# (if (= :read (:f ~op)) :fail :info)]
-         (assoc ~op :type crash# :error :socket-timeout)))
+         (assoc ~op :type crash# :error :client-timeout)))
      (catch Exception e#
        (let [crash# (if (= :read (:f ~op)) :fail :info)]
          (cond
