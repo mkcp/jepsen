@@ -424,9 +424,76 @@
 
 ;;;;;
 
+(defrecord DocHTTPMultiClient [node]
+  client/Client
+  (open! [this test node]
+    (assoc this :node (name node)))
+
+  (setup! [this test]
+    (info "Setting up client for node" node)
+    (try
+      (doc-setup-collection! test node)
+
+      ;; TODO We're probably going to need a different key setup here.
+      (catch Exception e
+        (when-not (already-exists? e)
+          (throw e)))))
+
+  (invoke! [this test op]
+    (with-errors op
+      (let [body (json/generate-string {:value "0"})
+            res  (http/put (doc-url node "0") (assoc doc-opts :body body))
+            rev  (-> res :body json/parse-string (get "_rev"))]
+        (assoc op :type :ok :value rev))))
+
+  (close! [this test])
+  (teardown! [this test]))
+
+(defn doc-http-multi-client [node] (DocHTTPMultiClient. node))
+
+;;;;;
+
+;; Single
 (defn r   [_ _] {:type :invoke :f :read  :value nil})
 (defn w   [_ _] {:type :invoke :f :write :value (rand-int 5)})
 (defn cas [_ _] {:type :invoke :f :cas   :value [(rand-int 5) (rand-int 5)]})
+
+
+;; Multi (from https://github.com/jepsen-io/voltdb/blob/master/src/jepsen/voltdb/multi.clj)
+(defn op [k]
+  (if (< (rand) 0.5)
+    [:write k (rand-in 3)]
+    [:read  k nil]))
+
+
+(defn op-with-read
+  "Like op, but yields sequences of transactions, prepending reads to writes."
+  [k]
+  (let [[f k v :as op] (op k)]
+    (if (= f :read)
+      [op]
+      [[:read k nil] op])))
+
+(defn txn
+  "A transaction is a sequence of [type k v] tuples, e.g. [[:read 0 3], [:write 1 2]]. For
+  grins, we always perform a read before a write. Yields a generator of transactions over
+  key-count registers."
+  [ks]
+  (let [ks (take (inc (rand-int (count ks))) (shuffle ks))]
+    (vec (mapcat op-with-read ks))))
+
+(defn txn-gen
+  "A generator of transactions on ks"
+  [ks]
+  (fn [_ _] {:type :invoke :f :txn :value (txn ks)}))
+
+(defn read-only-txn-gen
+  "Generator for read-only transactions"
+  [ks]
+  (fn [_ _]
+    {:type :invoke
+     :f    :txn
+     :value (mapv (fn [k] [:read k nil]) ks)}))
 
 ;;;;;
 
@@ -456,6 +523,10 @@
                                             :linear (checker/linearizable)}))
             :model (model/cas-register)}
 
+   :doc-http-revision {:client (doc-http-revision-client nil nil)
+                       :generator {:type :invoke, :f :generate}
+                       :checker (checker/unique-ids)}
+
    :doc-http-insert {:client (document-set-client nil)
                      :generator (->> (range)
                                      (map (fn [x] {:type :invoke
@@ -474,17 +545,26 @@
                                         10
                                         (range)
                                         (fn [k]
-                                          (->> (gen/mix     [r w])
+                                          (->> (gen/mix     [r w cas])
                                                (gen/stagger 1/30)
                                                (gen/limit   300)))))
                        :checker (independent/checker (checker/compose
                                                       {:timeline (timeline/html)
                                                        :linear (checker/linearizable)}))
-                       :model (model/register 0)}
+                       :model (model/cas-register 0)}
 
-   :doc-http-revision {:client (doc-http-revision-client nil nil)
-                       :generator {:type :invoke, :f :generate}
-                       :checker (checker/unique-ids)}})
+   :doc-http-multi-register {:client (doc-http-multi-client nil)
+                             :generator (->> (independent/concurrent-generator
+                                              10
+                                              (range)
+                                              (fn [k]
+                                                (->> (gen/mix     [r w cas])
+                                                     (gen/stagger 1/30)
+                                                     (gen/limit   300)))))
+                             :checker (independent/checker (checker/compose
+                                                            {:timeline (timeline/html)
+                                                             :linear (checker/linearizable)}))
+                             :model (model/multi-register {:x 0 :y 0})}})
 
 (defn arangodb-test
   [opts]
