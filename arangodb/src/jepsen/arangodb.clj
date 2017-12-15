@@ -530,7 +530,7 @@
    ;; TODO Shouldn't need this. Is it a bug in the env or in the deb?
    [nil "--install-deb? true/false" "Run dpkg installation during DB step? Workaround for repeated installs failing."
     :parse-fn #{"true"}
-    :missing (str "--install-deb? " false)]])
+    :default "true"]])
 
 ;; Example run: lein run test --concurrency 50 --workload document-rw --install-deb? false --time-limit 240
 
