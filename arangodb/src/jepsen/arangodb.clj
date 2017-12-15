@@ -40,6 +40,35 @@
 
 (defn deb-dest [version] (str "arangodb3-" version "-1_amd64.deb"))
 
+;; TODO Catch and wrap this error in "install-deb" Notify users to run without the true flag. Also probably submit a ticket
+;;      that the .deb should be idempotent
+; Caused by: java.lang.RuntimeException: sudo -S -u root bash -c "cd /; dpkg -i arangodb3-3.2.9-1_amd64.deb" returned non-zero exit status 1 on n1. STDOUT:
+; (Reading database ... 21581 files and directories currently installed.)
+; Preparing to unpack arangodb3-3.2.9-1_amd64.deb ...
+; Unpacking arangodb3 (3.2.9) over (3.2.9) ...
+; Setting up arangodb3 (3.2.9) ...
+; Processing triggers for man-db (2.7.0.2-5) ...
+
+
+; STDERR:
+; invoke-rc.d: policy-rc.d denied execution of stop.
+; debconf: unable to initialize frontend: Dialog
+; debconf: (Dialog frontend will not work on a dumb terminal, an emacs shell buffer, or without a controlling terminal.)
+; debconf: falling back to frontend: Readline
+; debconf: unable to initialize frontend: Readline
+; debconf: (This frontend requires a controlling tty.)
+; debconf: falling back to frontend: Teletype
+; invoke-rc.d: policy-rc.d denied execution of stop.
+; Error while processing config file '//etc/arangodb3/arangod.conf', line #29:
+; error setting value for option '--server.storage-engine': invalid value ''. possible values: "auto", "mmfiles", "rocksdb"
+
+; FATAL ERROR: EXIT_FAILED - "exit with error"
+; dpkg: error processing package arangodb3 (--install):
+; subprocess installed post-installation script returned error exit status 1
+; Errors were encountered while processing:
+; arangodb3
+
+
 (defn db [version storage-engine install-deb?]
   (reify db/DB
     (setup! [_ test node]
@@ -48,7 +77,7 @@
 
        ;; TODO Installation non-idempotency... woo spooky! (could caused by docker? permissions?)
        ;; For some reason the /etc/arangodb3 config changes, removing auto from server.storage-engine.
-       ;; This kills the dpkg (like, really kills, you can't even run other installs.)
+       ;; This kills the dpkg (like, really kills, you can't even apt and dpkg on other things.)
        (when install-deb?
          ;; Deps
          (c/exec :apt-get :install "-y" "-qq" "libjemalloc1")
