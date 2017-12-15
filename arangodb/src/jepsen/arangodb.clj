@@ -134,55 +134,42 @@
 
 ;;;;;
 
-;; HTTP exception classifiers
-;; TODO Lots of duplication here, can probably be simplified
-(defn invalid-body?     [e] (->> e .getMessage (re-find #"400") some?))
-(defn not-found?        [e] (->> e .getMessage (re-find #"404") some?))
-(defn already-exists?   [e] (->> e .getMessage (re-find #"409") some?))
-(defn precond-fail?     [e] (->> e .getMessage (re-find #"412") some?))
-(defn internal-error?   [e] (->> e .getMessage (re-find #"500") some?))
-(defn unavailable?      [e] (->> e .getMessage (re-find #"503") some?))
-(defn client-timed-out? [e] (->> e .getMessage (re-find #"Read timed out") some?))
+;; For Multi
+#_(defn read-only?
+  "Is a transaction a read-only transaction?"
+  [txn]
+  (every? #{:read} (map first txn)))
 
-#_(defn http-errors
-  "Takes a crash type for the current op, and return a mapping of its error patterns to
-  crash type and error message."
-  [crash]
-  {"400"            [:fail :key-not-found]
-   "404"            [:fail :already-exists]
-   "409"            [:fail :precondition-fail]
-   "412"            [:fail :invalid-body]
-   "500"            [crash :server-500]
-   "503"            [crash :node-unavailable]
-   "Read timed out" [crash :client-timeout]})
+#_(let [type (if (read-only? (val (:value op))) :fail :info)]
+    (condp re-find (.getMessage e#)
+      #"400"       (assoc ~op :type crash# :error :invalid-body)
+      #"404"       (assoc ~op :type crash# :error :key-not-found)
+      #"409"       (assoc ~op :type crash# :error :key-already-exists)
+      #"412"       (assoc ~op :type crash# :error :precondition-failed)
+      #"500"       (assoc ~op :type crash# :error :server-500)
+      #"503"       (assoc ~op :type crash# :error :node-unavailable)
+      #"timed out" (assoc ~op :type crash# :error :timeout)
+      (throw e#)))
 
-#_(let [crash        (if (= :read (:f op)) :fail :info)
-      errors       (http-errors crash)
-      message      (let [matchers (map re-pattern (keys errors))]
-                     (->> e .getMessage (map re-find matchers) first first))
-      ;; If we don't find an error, return :indeterminate
-      [type error] (get errors message [crash :indeterminate])]
-  (assoc op :type type :error message))
+;;;;;
+
+(defn already-exists? [e] (->> e .getMessage (re-find #"409") some?))
 
 (defmacro with-errors
   [op & body]
   `(try
      ~@body
-     (catch java.net.SocketTimeoutException e#
-       (let [crash# (if (= :read (:f ~op)) :fail :info)]
-         (assoc ~op :type crash# :error :client-timeout)))
      (catch Exception e#
        (let [crash# (if (= :read (:f ~op)) :fail :info)]
-         (cond
-           (not-found?        e#) (assoc ~op :type :fail  :error :key-not-found)
-           (already-exists?   e#) (assoc ~op :type :fail  :error :already-exists)
-           (precond-fail?     e#) (assoc ~op :type :fail  :error :precondition-fail)
-           (invalid-body?     e#) (assoc ~op :type :fail  :error :invalid-body)
-           (internal-error?   e#) (assoc ~op :type crash# :error :server-500)
-           (unavailable?      e#) (assoc ~op :type crash# :error :node-unavailable)
-           (client-timed-out? e#) (assoc ~op :type crash# :error :client-timeout)
-           :else                  (do (error (pr-str (.getMessage e#)))
-                                      (assoc ~op :type crash# :error :indeterminate)))))))
+         (condp re-find (.getMessage e#)
+           #"400"       (assoc ~op :type crash# :error :invalid-body)
+           #"404"       (assoc ~op :type crash# :error :key-not-found)
+           #"409"       (assoc ~op :type crash# :error :key-already-exists)
+           #"412"       (assoc ~op :type crash# :error :precondition-failed)
+           #"500"       (assoc ~op :type crash# :error :server-500)
+           #"503"       (assoc ~op :type crash# :error :node-unavailable)
+           #"timed out" (assoc ~op :type crash# :error :timeout)
+           (throw e#))))))
 
 ;;;;;
 
@@ -342,14 +329,14 @@
           :write (let [res (doc-write! node k v)]
                    ;; Sometimes we get a successful http response with error headers
                    (if-let [err (-> res :headers (get "X-Arango-Error-Codes"))]
-                     (assoc op :type :fail :error (keyword err))
+                     (assoc op :type :info :error (keyword err))
                      (assoc op :type :ok)))
 
           :cas (let [[v v'] v]
                  (if-let [res (doc-cas! node k v v')]
                    ;; Sometimes we get a successful http response with error headers
                    (if-let [err (-> res :headers (get "X-Arango-Error-Codes"))]
-                     (assoc op :type :fail :error (keyword err))
+                     (assoc op :type :info :error (keyword err))
                      (assoc op :type :ok))
                    (assoc op :type :fail)))))))
 
@@ -391,8 +378,10 @@
       (case (:f op)
         :add (let [res (http/post (doc-url node)
                                   (assoc doc-opts :body (json/generate-string {:_key (str (:value op))})))]
-               (swap! status-codes conj (:status res))
-               (assoc op :type :ok))
+               (if-let [err (-> res :headers (get "X-Arango-Error-Codes"))]
+                 ;; Sometimes we get a successful http response with error headers
+                 (assoc op :type :info :error (keyword err))
+                 (assoc op :type :ok)))
 
         :read (let [v (-> node read-all! read-all->ints set)]
                 (assoc op :type :ok :value v)))))
