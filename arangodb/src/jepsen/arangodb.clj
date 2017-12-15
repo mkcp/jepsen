@@ -349,7 +349,7 @@
 (defn read-all! [node]
   (let [url  (str "http://" node ":" db-port "/_api/simple/all")
         body (json/generate-string {:collection "jepsen"
-                                    :batchSize 100000})]
+                                    :batchSize 1000000})]
     (http/put url (assoc doc-opts :body body))))
 
 (defn read-all->ints
