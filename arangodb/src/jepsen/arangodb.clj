@@ -185,7 +185,10 @@
                        v   (parse-agency-read res)]
                    (if v
                      (assoc op :type :ok   :value (independent/tuple k v))
-                     (assoc op :type :fail :value (independent/tuple k v) :error :key-not-found)))
+                     (assoc op
+                            :type :fail
+                            :value (independent/tuple k v)
+                            :error :key-not-found)))
 
           :write (let [res (agency-write! node (str "/" k) v)]
                    (assoc op :type :ok))
@@ -203,11 +206,16 @@
 
 ;;;;;
 
-(def doc-opts {:conn-timeout 20000
-               :content-type :json
-               :trace-redirects true
+(def doc-opts {:conn-timeout      30000
+               :content-type      :json
+               :trace-redirects   true
                :redirect-strategy :lax
-               :socket-timeout 20000})
+               :socket-timeout    30000
+               ;; We occasionally get "key exists" type errors when performing
+               ;; unique inserts, so we need to figure out if its our client or a bug.
+               ;; clj-http performs retries on IO exceptions, so here
+               ;; we return false to make sure we do not retry in the client.
+               :retry-handler (fn [_ _ _] false)})
 
 (defn doc-url
   ([node] (str "http://" node ":" db-port "/_api/document/jepsen/"))
@@ -217,14 +225,15 @@
   (let [url (str "http://" node ":" db-port "/_api/collection/")
         body (json/generate-string {:name              "jepsen"
                                     :waitForSync       true
-                                    :numberOfShards    (count (:nodes test))
+                                    ;:numberOfShards    (count (:nodes test))
                                     :replicationFactor (count (:nodes test))})]
     (http/post url (assoc doc-opts :body body))))
 
 (defn init-keyspace!
-  "Creates keys with value 0 in our collection. The number of keys is 10 times the
-  concurrency val on the test. This isn't perfect because very long tests might
-  go past and run into errors."
+  "Creates keys with value 0 in our collection. The number of keys is 10 times
+  the concurrency val on the test. This isn't perfect because very long tests
+  might go past and run into errors, though at some point we'll hit the limit
+  of our linearizability checker. May need to be tuned further."
   [test node]
   (let [max (* 10 (:concurrency test))
         t   (mapv (fn [i] {:_key (str i) :value 0})
@@ -232,23 +241,30 @@
         body (json/generate-string t)]
     (http/post (doc-url node) (assoc doc-opts :body body))))
 
+(defn parse-doc-read [res]
+  (-> res :body json/parse-string (get "value")))
+
 (defn doc-read! [node k]
   (let [url (doc-url node k)]
     (http/get url doc-opts)))
 
 (defn doc-write! [node k v]
-  (let [url  (doc-url node)
-        body (json/generate-string [{:_key (str k) :value v}])]
+  (let [url  (doc-url node k)
+        body (json/generate-string {:value v})]
     (http/put url (assoc doc-opts :body body))))
 
-;; TODO Get _rev from read, write If-Match _rev
-(defn doc-cas! [node k v v']
-  (let [url  (doc-url node)
-        body (json/generate-string [{k v} {k v'}])]
-    (http/put url (assoc doc-opts :body body))))
-
-(defn parse-doc-read [res]
-  (-> res :body json/parse-string (get "value")))
+(defn doc-cas!
+  "Reads the current value of the register and writes if both the current value
+  matches and the revision has not changed since the read."
+  [node k v v']
+  (let [read-res (doc-read! node k)]
+    (when (= v (parse-doc-read read-res))
+      (let [rev  (-> read-res :body json/parse-string (get "_rev"))
+            url  (doc-url node k)
+            body (json/generate-string {:value v'})]
+        (http/put url (assoc doc-opts
+                             :body body
+                             :headers {"If-Match" rev}))))))
 
 (defrecord DocumentClient [node]
   client/Client
@@ -260,7 +276,6 @@
       (info "Setting up client for node" node)
       (doc-setup-collection! test node)
       (init-keyspace! test node)
-
       (catch java.net.SocketTimeoutException _
         (warn "Timeout occurred during collection setup, continuing anyway..."))
       (catch Exception e
@@ -276,9 +291,18 @@
                   (assoc op :type :ok :value (independent/tuple k v)))
 
           :write (let [res (doc-write! node k v)]
-                   (assoc op :type :ok))
+                   ;; Sometimes we get a successful http response with error headers
+                   (if-let [err (-> res :headers (get "X-Arango-Error-Codes"))]
+                     (assoc op :type :fail :error (keyword err))
+                     (assoc op :type :ok)))
 
-          :cas (assoc op :type :fail :error :not-implemented)))))
+          :cas (let [[v v'] v]
+                 (if-let [res (doc-cas! node k v v')]
+                   ;; Sometimes we get a successful http response with error headers
+                   (if-let [err (-> res :headers (get "X-Arango-Error-Codes"))]
+                     (assoc op :type :fail :error (keyword err))
+                     (assoc op :type :ok))
+                   (assoc op :type :fail)))))))
 
   ;; HTTP clients are not stateful
   (close! [_ _])
@@ -289,11 +313,11 @@
 (defn read-all! [node]
   (let [url  (str "http://" node ":" db-port "/_api/simple/all")
         body (json/generate-string {:collection "jepsen"
-                                    :batchSize 50000})]
+                                    :batchSize 100000})]
     (http/put url (assoc doc-opts :body body))))
 
 (defn read-all->ints
-  "Takes an http response from a full and produces a sequence of Arango document keys"
+  "Takes an http response from a full read and produces a sequence of Arango document keys"
   [res]
   (let [result (-> res :body json/parse-string (get "result"))]
     (map #(Integer. (get % "_key")) result)))
@@ -307,7 +331,6 @@
     (info "Setting up client for node" node)
     (try
       (doc-setup-collection! test node)
-
       (catch java.net.SocketTimeoutException _
         (warn "Timeout occurred during collection setup, continuing anyway..."))
       (catch Exception e
@@ -326,8 +349,7 @@
                 (assoc op :type :ok :value v)))))
 
   (close! [this test])
-  (teardown! [this test]
-    (debug "Statuses" (pprint-str @status-codes))))
+  (teardown! [this test]))
 
 (defn document-set-client [node] (DocumentSetClient. node))
 
