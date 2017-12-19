@@ -36,59 +36,35 @@
 (def status-codes (atom #{}))
 
 (defn deb-src [version]
-  (str "https://download.arangodb.com/arangodb32/Debian_8.0/amd64/arangodb3-" version "-1_amd64.deb"))
+  (str "https://download.arangodb.com/arangodb33/Debian_8.0/amd64/arangodb3-" version "-1_amd64.deb"))
 
 (defn deb-dest [version] (str "arangodb3-" version "-1_amd64.deb"))
 
-;; TODO Catch and wrap this error in "install-deb" Notify users to run without the true flag. Also probably submit a ticket
-;;      that the .deb should be idempotent
-; Caused by: java.lang.RuntimeException: sudo -S -u root bash -c "cd /; dpkg -i arangodb3-3.2.9-1_amd64.deb" returned non-zero exit status 1 on n1. STDOUT:
-; (Reading database ... 21581 files and directories currently installed.)
-; Preparing to unpack arangodb3-3.2.9-1_amd64.deb ...
-; Unpacking arangodb3 (3.2.9) over (3.2.9) ...
-; Setting up arangodb3 (3.2.9) ...
-; Processing triggers for man-db (2.7.0.2-5) ...
-
-
-; STDERR:
-; invoke-rc.d: policy-rc.d denied execution of stop.
-; debconf: unable to initialize frontend: Dialog
-; debconf: (Dialog frontend will not work on a dumb terminal, an emacs shell buffer, or without a controlling terminal.)
-; debconf: falling back to frontend: Readline
-; debconf: unable to initialize frontend: Readline
-; debconf: (This frontend requires a controlling tty.)
-; debconf: falling back to frontend: Teletype
-; invoke-rc.d: policy-rc.d denied execution of stop.
-; Error while processing config file '//etc/arangodb3/arangod.conf', line #29:
-; error setting value for option '--server.storage-engine': invalid value ''. possible values: "auto", "mmfiles", "rocksdb"
-
-; FATAL ERROR: EXIT_FAILED - "exit with error"
-; dpkg: error processing package arangodb3 (--install):
-; subprocess installed post-installation script returned error exit status 1
-; Errors were encountered while processing:
-; arangodb3
-
-
-(defn db [version storage-engine install-deb?]
+(defn db [version storage-engine]
   (reify db/DB
     (setup! [_ test node]
       (c/su
-       (info node "Installing arangodb" version)
+       (try
+           (info node "Installing arangodb" version)
+           ;; Deps
+           (c/exec :apt-get :install "-y" "-qq" "libjemalloc1")
 
-       ;; TODO Installation non-idempotency... woo spooky! (could caused by docker? permissions?)
-       ;; For some reason the /etc/arangodb3 config changes, removing auto from server.storage-engine.
-       ;; This kills the dpkg (like, really kills, you can't even apt and dpkg on other things.)
-       (when install-deb?
-         ;; Deps
-         (c/exec :apt-get :install "-y" "-qq" "libjemalloc1")
+           ;; Password stuff?
+           (c/exec :echo :arangodb3 "arangodb3/password" "password" "" "|" :debconf-set-selections)
+           (c/exec :echo :arangodb3 "arangodb3/password_again" "password" "" "|" :debconf-set-selections)
 
-         ;; Password stuff?
-         (c/exec :echo :arangodb3 "arangodb3/password" "password" "" "|" :debconf-set-selections)
-         (c/exec :echo :arangodb3 "arangodb3/password_again" "password" "" "|" :debconf-set-selections)
+           ;; Download & install
+           (c/exec :test "-f" (deb-dest version) "||" :wget :-q (deb-src version) :-O (deb-dest version))
+           (c/exec :dpkg :-i (deb-dest version))
 
-         ;; Download & install
-         (c/exec :test "-f" (deb-dest version) "||" :wget :-q (deb-src version) :-O (deb-dest version))
-         (c/exec :dpkg :-i (deb-dest version)))
+           ;; On a second installation, /etc/arangodb3 config changes, removing the value "auto"
+           ;; from server.storage-engine in config. _This kills the dpkg_ We don't have to install again
+           ;; here so we continue with the test. I don't believe this is causing any problems, but it's definitely
+           ;; suspect. Debs should be idempotent... right?
+           (catch RuntimeException e
+             (if (re-find #"Error while processing config file" (.getMessage e))
+               (warn "A dpkg error occurred during setup, continuing anyway! See DB setup docs for more info")
+               (throw e))))
 
        ;; Ensure data directories are clean
        (c/exec :rm :-rf (keyword dir))
@@ -248,9 +224,8 @@
                :redirect-strategy :lax
                :socket-timeout    30000
                ;; We occasionally get "key exists" type errors when performing
-               ;; unique inserts, so we need to figure out if its our client or a bug.
-               ;; clj-http performs retries on IO exceptions, so here
-               ;; we return false to make sure we do not retry in the client.
+               ;; unique inserts, here we disable retries client-side to ensure
+               ;; these error aren't caused by our client retrying IO exceptions
                :retry-handler (fn [_ _ _] false)})
 
 (defn doc-url
@@ -268,7 +243,8 @@
 (defn init-keyspace!
   "Creates keys with value 0 in our collection. The number of keys is 10 times
   the concurrency val on the test. This isn't perfect because very long tests
-  might go past and run into errors, though at some point we'll hit the limit
+  might go past and run into errors... but on the other end it's limited
+  at some point we'll hit the limit
   of our linearizability checker. May need to be tuned further."
   [test node]
   (let [max (* 10 (:concurrency test))
@@ -302,18 +278,101 @@
                              :body body
                              :headers {"If-Match" rev}))))))
 
-(defrecord DocumentClient [node]
+(defn read-all! [node]
+  (let [url  (str "http://" node ":" db-port "/_api/simple/all")
+        body (json/generate-string {:collection "jepsen"
+                                    :batchSize 1000000})]
+    (http/put url (assoc doc-opts :body body))))
+
+(defn read-all->ints
+  "Takes an http response from a full read and produces a sequence of Arango document keys"
+  [res]
+  (let [result (-> res :body json/parse-string (get "result"))]
+    (map #(Integer. (get % "_key")) result)))
+
+;;;;;
+
+(defrecord DocumentSetClient [node]
   client/Client
   (open! [this test node]
     (assoc this :node (name node)))
 
   (setup! [this test]
     (try
+      (doc-setup-collection! test node)
+      (catch java.net.SocketTimeoutException _
+        (warn "Timeout during collection setup, continuing anyway..."))
+      (catch Exception e
+        (when-not (already-exists? e)
+          (throw e)))))
+
+  (invoke! [this test op]
+    (with-errors op
+      (case (:f op)
+        :add (let [res (http/post (doc-url node)
+                                  (assoc doc-opts :body (json/generate-string {:_key (str (:value op))})))]
+               (if-let [err (-> res :headers (get "X-Arango-Error-Codes"))]
+                 ;; Sometimes we get a successful http response with error headers
+                 (assoc op :type :info :error (keyword err))
+                 (assoc op :type :ok)))
+
+        :read (let [v (-> node read-all! read-all->ints set)]
+                (assoc op :type :ok :value v)))))
+
+  (close! [this test])
+  (teardown! [this test]))
+
+(defn document-set-client [node] (DocumentSetClient. node))
+
+;;;;;
+
+(defrecord DocHTTPRevisionClient [node revisions]
+  client/Client
+  (open! [this test node]
+    (assoc this :node (name node)))
+
+  ;; TODO Use initialized?
+  (setup! [this test]
+    (info "Setting up client for node" node)
+    (try
+      (doc-setup-collection! test node)
+      ;; TODO We throw away our first revision... that's maybe not great!
+      (http/post (doc-url node)
+                 (assoc doc-opts :body (json/generate-string {:_key "0"})))
+      (catch java.net.SocketTimeoutException _
+        (warn "Timeout during collection setup, continuing anyway..."))
+      (catch Exception e
+        (when-not (already-exists? e)
+          (throw e)))))
+
+  (invoke! [this test op]
+    (with-errors op
+      (assert (= (:f op) :generate))
+      (let [body (json/generate-string {:value "0"})
+            res  (http/put (doc-url node "0") (assoc doc-opts :body body))
+            rev  (-> res :body json/parse-string (get "_rev"))]
+        (assoc op :type :ok :value rev))))
+
+  (close! [this test])
+  (teardown! [this test]))
+
+(defn doc-http-revision-client [node revisions] (DocHTTPRevisionClient. node revisions))
+
+;;;;;
+
+(defrecord DocumentClient [node]
+  client/Client
+  (open! [this test node]
+    (assoc this :node (name node)))
+
+  ;; TODO Use initialized?
+  (setup! [this test]
+    (try
       (info "Setting up client for node" node)
       (doc-setup-collection! test node)
       (init-keyspace! test node)
       (catch java.net.SocketTimeoutException _
-        (warn "Timeout occurred during collection setup, continuing anyway..."))
+        (warn "Timeout during collection setup, continuing anyway..."))
       (catch Exception e
         (when-not (already-exists? e)
           (throw e)))))
@@ -346,98 +405,22 @@
 
 (defn document-register-client [node] (DocumentClient. node))
 
-(defn read-all! [node]
-  (let [url  (str "http://" node ":" db-port "/_api/simple/all")
-        body (json/generate-string {:collection "jepsen"
-                                    :batchSize 1000000})]
-    (http/put url (assoc doc-opts :body body))))
-
-(defn read-all->ints
-  "Takes an http response from a full read and produces a sequence of Arango document keys"
-  [res]
-  (let [result (-> res :body json/parse-string (get "result"))]
-    (map #(Integer. (get % "_key")) result)))
-
-(defrecord DocumentSetClient [node]
-  client/Client
-  (open! [this test node]
-    (assoc this :node (name node)))
-
-  (setup! [this test]
-    (info "Setting up client for node" node)
-    (try
-      (doc-setup-collection! test node)
-      (catch java.net.SocketTimeoutException _
-        (warn "Timeout occurred during collection setup, continuing anyway..."))
-      (catch Exception e
-        (when-not (already-exists? e)
-          (throw e)))))
-
-  (invoke! [this test op]
-    (with-errors op
-      (case (:f op)
-        :add (let [res (http/post (doc-url node)
-                                  (assoc doc-opts :body (json/generate-string {:_key (str (:value op))})))]
-               (if-let [err (-> res :headers (get "X-Arango-Error-Codes"))]
-                 ;; Sometimes we get a successful http response with error headers
-                 (assoc op :type :info :error (keyword err))
-                 (assoc op :type :ok)))
-
-        :read (let [v (-> node read-all! read-all->ints set)]
-                (assoc op :type :ok :value v)))))
-
-  (close! [this test])
-  (teardown! [this test]))
-
-(defn document-set-client [node] (DocumentSetClient. node))
-
-(defrecord DocHTTPRevisionClient [node revisions]
-  client/Client
-  (open! [this test node]
-    (assoc this :node (name node)))
-
-  (setup! [this test]
-    (info "Setting up client for node" node)
-    (try
-      (doc-setup-collection! test node)
-      ;; TODO We throw away our first revision... that's maybe not great!
-      (http/post (doc-url node)
-                 (assoc doc-opts :body (json/generate-string {:_key "0"})))
-      (catch java.net.SocketTimeoutException _
-        (warn "Timeout occurred during collection setup, continuing anyway..."))
-      (catch Exception e
-        (when-not (already-exists? e)
-          (throw e)))))
-
-  (invoke! [this test op]
-    (with-errors op
-      (assert (= (:f op) :generate))
-      (let [body (json/generate-string {:value "0"})
-            res  (http/put (doc-url node "0") (assoc doc-opts :body body))
-            rev  (-> res :body json/parse-string (get "_rev"))]
-        (assoc op :type :ok :value rev))))
-
-  (close! [this test])
-  (teardown! [this test]))
-
-(defn doc-http-revision-client [node revisions] (DocHTTPRevisionClient. node revisions))
-
 ;;;;;
 
-(defrecord DocHTTPMultiClient [node]
+(defrecord DocHTTPMultiClient [node ks]
   client/Client
   (open! [this test node]
     (assoc this :node (name node)))
 
   (setup! [this test]
-    (info "Setting up client for node" node)
-    (try
-      (doc-setup-collection! test node)
-
-      ;; TODO We're probably going to need a different key setup here.
-      (catch Exception e
-        (when-not (already-exists? e)
-          (throw e)))))
+    (let [initialized? (promise)]
+      (info "Setting up client for node" node)
+      (when (deliver initialized? true)
+        (doc-setup-collection! test node)
+        (doseq [k ks]
+          (http/post (doc-url node k)
+                     (assoc doc-opts :body (json/generate-string {:value 0}))))
+        (info "initial state populated"))))
 
   (invoke! [this test op]
     (with-errors op
@@ -449,7 +432,7 @@
   (close! [this test])
   (teardown! [this test]))
 
-(defn doc-http-multi-client [node] (DocHTTPMultiClient. node))
+(defn doc-http-multi-client [node ks] (DocHTTPMultiClient. node ks))
 
 ;;;;;
 
@@ -458,13 +441,11 @@
 (defn w   [_ _] {:type :invoke :f :write :value (rand-int 5)})
 (defn cas [_ _] {:type :invoke :f :cas   :value [(rand-int 5) (rand-int 5)]})
 
-
 ;; Multi (from https://github.com/jepsen-io/voltdb/blob/master/src/jepsen/voltdb/multi.clj)
 (defn op [k]
   (if (< (rand) 0.5)
-    [:write k (rand-in 3)]
+    [:write k (rand-int 3)]
     [:read  k nil]))
-
 
 (defn op-with-read
   "Like op, but yields sequences of transactions, prepending reads to writes."
@@ -553,18 +534,21 @@
                                                        :linear (checker/linearizable)}))
                        :model (model/cas-register 0)}
 
-   :doc-http-multi-register {:client (doc-http-multi-client nil)
-                             :generator (->> (independent/concurrent-generator
-                                              10
-                                              (range)
-                                              (fn [k]
-                                                (->> (gen/mix     [r w cas])
-                                                     (gen/stagger 1/30)
-                                                     (gen/limit   300)))))
-                             :checker (independent/checker (checker/compose
-                                                            {:timeline (timeline/html)
-                                                             :linear (checker/linearizable)}))
-                             :model (model/multi-register {:x 0 :y 0})}})
+   :doc-http-multi-register (let [ks [:x :y]]
+                              {:client (doc-http-multi-client nil ks)
+                               :checker (checker/compose
+                                         {:perf (checker/perf)
+                                          :timeline (independent/checker (timeline/html))
+                                          :linear (independent/checker (checker/linearizable))})
+                               :model (model/multi-register (zipmap ks (repeat 0)))
+                               :generator (->> (independent/concurrent-generator
+                                                10
+                                                (range)
+                                                (fn [id]
+                                                  (->> (txn-gen ks)
+                                                       (gen/stagger 5)
+                                                       (gen/reserve 5 (read-only-txn-gen ks))
+                                                       (gen/stagger 1)))))})})
 
 (defn arangodb-test
   [opts]
@@ -590,7 +574,7 @@
            opts
            {:name      (str "arangodb " (name (:workload opts)))
             :os        debian/os
-            :db        (db "3.2.9" "auto" (:install-deb? opts))
+            :db        (db "3.3.beta1" "auto")
             :client    client
             :nemesis   (nemesis/partition-random-halves)
             :generator generator
@@ -606,13 +590,9 @@
   [[nil "--workload WORKLOAD" "Test workload to run, e.g. agency"
     :parse-fn keyword
     :missing (str "--workload " (cli/one-of (workloads)))
-    :validate [(workloads) (cli/one-of (workloads))]]
-   ;; TODO Shouldn't need this. Is it a bug in the env or in the deb?
-   [nil "--install-deb? true/false" "Run dpkg installation during DB step? Workaround for repeated installs failing."
-    :parse-fn #{"true"}
-    :default "true"]])
+    :validate [(workloads) (cli/one-of (workloads))]]])
 
-;; Example run: lein run test --concurrency 50 --workload document-rw --install-deb? false --time-limit 240
+;; Example run: lein run test --concurrency 50 --workload document-rw --time-limit 240
 
 (defn -main
   "Handles command line arguments. Can either run a test, or a web server for
