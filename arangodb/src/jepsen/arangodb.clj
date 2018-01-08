@@ -36,7 +36,7 @@
 (def status-codes (atom #{}))
 
 (defn deb-src [version]
-  (str "https://download.arangodb.com/arangodb33/Debian_8.0/amd64/arangodb3-" version "-1_amd64.deb"))
+  (str "https://download.arangodb.com/arangodb32/Debian_8.0/amd64/arangodb3-" version "-1_amd64.deb"))
 
 (defn deb-dest [version] (str "arangodb3-" version "-1_amd64.deb"))
 
@@ -292,7 +292,7 @@
 
 ;;;;;
 
-(defrecord DocumentSetClient [node]
+(defrecord DocSetClient [node]
   client/Client
   (open! [this test node]
     (assoc this :node (name node)))
@@ -315,28 +315,26 @@
                  ;; Sometimes we get a successful http response with error headers
                  (assoc op :type :info :error (keyword err))
                  (assoc op :type :ok)))
-
         :read (let [v (-> node read-all! read-all->ints set)]
                 (assoc op :type :ok :value v)))))
 
   (close! [this test])
   (teardown! [this test]))
 
-(defn document-set-client [node] (DocumentSetClient. node))
+(defn doc-set-client [node] (DocSetClient. node))
 
 ;;;;;
 
-(defrecord DocHTTPRevisionClient [node revisions]
+(defrecord DocRevisionClient [node revisions]
   client/Client
   (open! [this test node]
     (assoc this :node (name node)))
 
-  ;; TODO Use initialized?
   (setup! [this test]
     (info "Setting up client for node" node)
     (try
       (doc-setup-collection! test node)
-      ;; TODO We throw away our first revision... that's maybe not great!
+      ;; TODO We throw away our first revision... could be missing a collision!
       (http/post (doc-url node)
                  (assoc doc-opts :body (json/generate-string {:_key "0"})))
       (catch java.net.SocketTimeoutException _
@@ -356,16 +354,15 @@
   (close! [this test])
   (teardown! [this test]))
 
-(defn doc-http-revision-client [node revisions] (DocHTTPRevisionClient. node revisions))
+(defn doc-revision-client [node revisions] (DocRevisionClient. node revisions))
 
 ;;;;;
 
-(defrecord DocumentClient [node]
+(defrecord DocRegisterClient [node]
   client/Client
   (open! [this test node]
     (assoc this :node (name node)))
 
-  ;; TODO Use initialized?
   (setup! [this test]
     (try
       (info "Setting up client for node" node)
@@ -403,24 +400,22 @@
   (close! [_ _])
   (teardown! [_ _]))
 
-(defn document-register-client [node] (DocumentClient. node))
+(defn doc-register-client [node] (DocRegisterClient. node))
 
 ;;;;;
 
-(defrecord DocHTTPMultiClient [node ks]
+(defrecord DocMultiClient [node ks]
   client/Client
   (open! [this test node]
     (assoc this :node (name node)))
 
   (setup! [this test]
-    (let [initialized? (promise)]
-      (info "Setting up client for node" node)
-      (when (deliver initialized? true)
-        (doc-setup-collection! test node)
-        (doseq [k ks]
-          (http/post (doc-url node k)
-                     (assoc doc-opts :body (json/generate-string {:value 0}))))
-        (info "initial state populated"))))
+    (info "Setting up client for node" node)
+    (doc-setup-collection! test node)
+    (doseq [k ks]
+      (http/post (doc-url node k)
+                 (assoc doc-opts :body (json/generate-string {:value 0}))))
+    (info "initial state populated"))
 
   (invoke! [this test op]
     (with-errors op
@@ -432,7 +427,7 @@
   (close! [this test])
   (teardown! [this test]))
 
-(defn doc-http-multi-client [node ks] (DocHTTPMultiClient. node ks))
+(defn doc-multi-client [node ks] (DocMultiClient. node ks))
 
 ;;;;;
 
@@ -504,51 +499,51 @@
                                             :linear (checker/linearizable)}))
             :model (model/cas-register)}
 
-   :doc-http-revision {:client (doc-http-revision-client nil nil)
-                       :generator {:type :invoke, :f :generate}
-                       :checker (checker/unique-ids)}
+   :doc-revision {:client (doc-revision-client nil nil)
+                  :generator {:type :invoke, :f :generate}
+                  :checker (checker/unique-ids)}
 
-   :doc-http-insert {:client (document-set-client nil)
-                     :generator (->> (range)
-                                     (map (fn [x] {:type :invoke
-                                                   :f    :add
-                                                   :value x}))
-                                     gen/seq
-                                     (gen/stagger 1/10))
-                     :final-generator (->> {:type :invoke, :f :read}
-                                           gen/once
-                                           gen/each)
-                     :checker (checker/set)
-                     :model (model/set)}
+   :doc-insert {:client (doc-set-client nil)
+                :generator (->> (range)
+                                (map (fn [x] {:type :invoke
+                                              :f    :add
+                                              :value x}))
+                                gen/seq
+                                (gen/stagger 1/10))
+                :final-generator (->> {:type :invoke, :f :read}
+                                      gen/once
+                                      gen/each)
+                :checker (checker/set)
+                :model (model/set)}
 
-   :doc-http-register {:client (document-register-client nil)
-                       :generator (->> (independent/concurrent-generator
-                                        10
-                                        (range)
-                                        (fn [k]
-                                          (->> (gen/mix     [r w cas])
-                                               (gen/stagger 1/30)
-                                               (gen/limit   300)))))
-                       :checker (independent/checker (checker/compose
-                                                      {:timeline (timeline/html)
-                                                       :linear (checker/linearizable)}))
-                       :model (model/cas-register 0)}
+   :doc-register {:client (doc-register-client nil)
+                  :generator (->> (independent/concurrent-generator
+                                   10
+                                   (range)
+                                   (fn [k]
+                                     (->> (gen/mix     [r w cas])
+                                          (gen/stagger 1/30)
+                                          (gen/limit   300)))))
+                  :checker (independent/checker (checker/compose
+                                                 {:timeline (timeline/html)
+                                                  :linear (checker/linearizable)}))
+                  :model (model/cas-register 0)}
 
-   :doc-http-multi-register (let [ks [:x :y]]
-                              {:client (doc-http-multi-client nil ks)
-                               :checker (checker/compose
-                                         {:perf (checker/perf)
-                                          :timeline (independent/checker (timeline/html))
-                                          :linear (independent/checker (checker/linearizable))})
-                               :model (model/multi-register (zipmap ks (repeat 0)))
-                               :generator (->> (independent/concurrent-generator
-                                                10
-                                                (range)
-                                                (fn [id]
-                                                  (->> (txn-gen ks)
-                                                       (gen/stagger 5)
-                                                       (gen/reserve 5 (read-only-txn-gen ks))
-                                                       (gen/stagger 1)))))})})
+   :doc-multi (let [ks [:x :y]]
+                {:client (doc-multi-client nil ks)
+                 :checker (checker/compose
+                           {:perf (checker/perf)
+                            :timeline (independent/checker (timeline/html))
+                            :linear (independent/checker (checker/linearizable))})
+                 :model (model/multi-register (zipmap ks (repeat 0)))
+                 :generator (->> (independent/concurrent-generator
+                                  10
+                                  (range)
+                                  (fn [id]
+                                    (->> (txn-gen ks)
+                                         (gen/stagger 5)
+                                         (gen/reserve 5 (read-only-txn-gen ks))
+                                         (gen/stagger 1)))))})})
 
 (defn arangodb-test
   [opts]
@@ -574,7 +569,7 @@
            opts
            {:name      (str "arangodb " (name (:workload opts)))
             :os        debian/os
-            :db        (db "3.3.beta1" "auto")
+            :db        (db "3.2.9" (:storage-engine opts))
             :client    client
             :nemesis   (nemesis/partition-random-halves)
             :generator generator
@@ -590,7 +585,10 @@
   [[nil "--workload WORKLOAD" "Test workload to run, e.g. agency"
     :parse-fn keyword
     :missing (str "--workload " (cli/one-of (workloads)))
-    :validate [(workloads) (cli/one-of (workloads))]]])
+    :validate [(workloads) (cli/one-of (workloads))]]
+   [nil "--storage-engine ENGINE" "Storage engine to use: [auto, mmfiles, rocksdb] Default: auto"
+    :parse-fn #(str %)
+    :default "auto"]])
 
 ;; Example run: lein run test --concurrency 50 --workload document-rw --time-limit 240
 
