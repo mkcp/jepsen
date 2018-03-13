@@ -14,6 +14,7 @@
              [tests      :as tests]
              [util       :refer [timeout meh pprint-str]]
              [cli :as cli]]
+            [jepsen.nemesis.time :as nemtime]
             [jepsen.control.net :as net]
             [jepsen.control.util :as cu]
             [jepsen.checker.timeline :as timeline]
@@ -36,7 +37,7 @@
 (def status-codes (atom #{}))
 
 (defn deb-src [version]
-  (str "https://download.arangodb.com/arangodb32/Debian_8.0/amd64/arangodb3-" version "-1_amd64.deb"))
+  (str "https://download.arangodb.com/arangodb33/Debian_8.0/amd64/arangodb3-" version "-1_amd64.deb"))
 
 (defn deb-dest [version] (str "arangodb3-" version "-1_amd64.deb"))
 
@@ -45,26 +46,27 @@
     (setup! [_ test node]
       (c/su
        (try
-           (info node "Installing arangodb" version)
-           ;; Deps
-           (c/exec :apt-get :install "-y" "-qq" "libjemalloc1")
+         (nemtime/install!)
+         (info node "Installing arangodb" version)
+         ;; Deps
+         (c/exec :apt-get :install "-y" "-qq" "libjemalloc1")
 
-           ;; Password stuff?
-           (c/exec :echo :arangodb3 "arangodb3/password" "password" "" "|" :debconf-set-selections)
-           (c/exec :echo :arangodb3 "arangodb3/password_again" "password" "" "|" :debconf-set-selections)
+         ;; Password stuff?
+         (c/exec :echo :arangodb3 "arangodb3/password" "password" "" "|" :debconf-set-selections)
+         (c/exec :echo :arangodb3 "arangodb3/password_again" "password" "" "|" :debconf-set-selections)
 
-           ;; Download & install
-           (c/exec :test "-f" (deb-dest version) "||" :wget :-q (deb-src version) :-O (deb-dest version))
-           (c/exec :dpkg :-i (deb-dest version))
+         ;; Download & install
+         (c/exec :test "-f" (deb-dest version) "||" :wget :-q (deb-src version) :-O (deb-dest version))
+         (c/exec :dpkg :-i (deb-dest version))
 
-           ;; On a second installation, /etc/arangodb3 config changes, removing the value "auto"
-           ;; from server.storage-engine in config. _This kills the dpkg_ We don't have to install again
-           ;; here so we continue with the test. I don't believe this is causing any problems, but it's definitely
-           ;; suspect. Debs should be idempotent... right?
-           (catch RuntimeException e
-             (if (re-find #"Error while processing config file" (.getMessage e))
-               (warn "A dpkg error occurred during setup, continuing anyway! See DB setup docs for more info")
-               (throw e))))
+         ;; On a second installation, /etc/arangodb3 config changes, removing the value "auto"
+         ;; from server.storage-engine in config. _This kills the dpkg_ We don't have to install again
+         ;; here so we continue with the test. I don't believe this is causing any problems, but it's definitely
+         ;; suspect. Debs should be idempotent... right?
+         (catch RuntimeException e
+           (if (re-find #"Error while processing config file" (.getMessage e))
+             (warn "A dpkg error occurred during setup, continuing anyway! See DB setup docs for more info")
+             (throw e))))
 
        ;; Ensure data directories are clean
        (c/exec :rm :-rf (keyword dir))
@@ -130,6 +132,7 @@
 ;;;;;
 
 (defn already-exists? [e] (->> e .getMessage (re-find #"409") some?))
+(defn server-500?     [e] (->> e .getMessage (re-find #"500") some?))
 
 (defmacro with-errors
   [op & body]
@@ -218,11 +221,11 @@
 
 ;;;;;
 
-(def doc-opts {:conn-timeout      30000
+(def doc-opts {:conn-timeout      7500
                :content-type      :json
                :trace-redirects   true
                :redirect-strategy :lax
-               :socket-timeout    30000
+               :socket-timeout    7500
                ;; We occasionally get "key exists" type errors when performing
                ;; unique inserts, here we disable retries client-side to ensure
                ;; these error aren't caused by our client retrying IO exceptions
@@ -243,9 +246,8 @@
 (defn init-keyspace!
   "Creates keys with value 0 in our collection. The number of keys is 10 times
   the concurrency val on the test. This isn't perfect because very long tests
-  might go past and run into errors... but on the other end it's limited
-  at some point we'll hit the limit
-  of our linearizability checker. May need to be tuned further."
+  might go past and run into errors... but at some point we'll hit the limit
+  of our linearizability checker. <shruggy> This may need to be tuned later."
   [test node]
   (let [max (* 10 (:concurrency test))
         t   (mapv (fn [i] {:_key (str i) :value 0})
@@ -554,14 +556,19 @@
                 checker
                 model]} (get (workloads) (:workload opts))
         generator (->> generator
-                       (gen/nemesis (gen/start-stop 30 20)) ;; Alternative hits: 20 10
+                       ;; Dropped writes: *(30 15) (10 10) (5 10) (20 10) (45 30)
+                       ;; No drops: (5 5)
+                       ;; Partitions needs to last at least 10 seconds
+                       (gen/nemesis ;(gen/start-stop 10 10))
+                        (gen/mix [(gen/start-stop 10 10) (nemtime/clock-gen)]))
                        (gen/time-limit (:time-limit opts)))
         generator (if-not final-generator
                     generator
                     (gen/phases generator
                                 (gen/log "Healing cluster")
-                                (gen/nemesis
-                                 (gen/once {:type :info, :f :stop}))
+                                ; (gen/nemesis (gen/once ))
+                                (gen/nemesis (gen/once (gen/seq {:type :info, :f :reset}
+                                                                {:type :info, :f :stop})))
                                 (gen/log "Waiting for quiescence")
                                 (gen/sleep 30)
                                 (gen/clients final-generator)))]
@@ -569,9 +576,12 @@
            opts
            {:name      (str "arangodb " (name (:workload opts)))
             :os        debian/os
-            :db        (db "3.2.9" (:storage-engine opts))
+            :db        (db "3.3.2" (:storage-engine opts))
             :client    client
-            :nemesis   (nemesis/partition-random-halves)
+            :nemesis ;(nemesis/partition-random-halves)
+                      (nemesis/compose
+                       {#{:start :stop} (nemesis/partition-random-halves)
+                        #{:reset :bump :strobe} (nemtime/clock-nemesis)})
             :generator generator
             :model     model
             :checker   (checker/compose
@@ -590,7 +600,7 @@
     :parse-fn #(str %)
     :default "auto"]])
 
-;; Example run: lein run test --concurrency 50 --workload document-rw --time-limit 240
+;; Example run: lein run test --concurrency 50 --workload doc-insert --time-limit 240
 
 (defn -main
   "Handles command line arguments. Can either run a test, or a web server for
