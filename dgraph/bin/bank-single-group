@@ -1,0 +1,13 @@
+cd ..; lein run test \
+--package-url https://s3-us-west-2.amazonaws.com/jepsen-bins/dgraph-linux-amd64.tar.gz \
+--force-download \
+--nemesis none \
+--workload bank \
+--rebalance-interval 10h \
+--sequencing server \
+--upsert-schema \
+--time-limit 600 \
+--concurrency 10 \
+--retry-db-setup \ # Should not be needed
+--test-count 20 \
+--replicas 5;

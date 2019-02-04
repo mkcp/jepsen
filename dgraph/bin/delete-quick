@@ -1,0 +1,10 @@
+cd ..; lein run test \
+--package-url https://github.com/dgraph-io/dgraph/releases/download/v1.0.8/dgraph-linux-amd64.tar.gz \
+--force-download \
+--workload delete \
+--rebalance-interval 10h \
+--upsert-schema \
+--time-limit 60 \
+--concurrency 9 \
+--nodes "n1, n2, n3" \
+--replicas 3;

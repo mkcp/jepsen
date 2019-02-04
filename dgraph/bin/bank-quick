@@ -1,0 +1,13 @@
+cd ..; lein run test \
+--package-url https://s3-us-west-2.amazonaws.com/jepsen-bins/dgraph-linux-amd64.tar.gz \
+--force-download \
+--nemesis partition-halves,skew-clock \
+--workload bank \
+--rebalance-interval 10h \
+--upsert-schema \
+--time-limit 60 \
+--test-count 2 \
+--concurrency 9 \
+--nodes "n1, n2, n3" \
+--replicas 3 \
+--tracing http://host.docker.internal:14268/api/traces;

@@ -1,0 +1,10 @@
+cd ..; lein run test \
+--package-url https://s3-us-west-2.amazonaws.com/jepsen-bins/dgraph-linux-amd64.tar.gz \
+--force-download \
+--workload bank \
+--nemesis move-tablet \
+--rebalance-interval 10h \
+--upsert-schema \
+--time-limit 90 \
+--concurrency 30 \
+--test-count 20;

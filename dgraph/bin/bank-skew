@@ -1,0 +1,13 @@
+cd ..; lein run test \
+--package-url https://github.com/dgraph-io/dgraph/releases/download/v1.0.9/dgraph-linux-amd64.tar.gz \
+--force-download \
+--workload bank \
+--nemesis skew-clock \
+--skew huge \
+--rebalance-interval 10h \
+--upsert-schema \
+--time-limit 600 \
+--concurrency 50 \
+--nodes "n1, n2, n3, n4, n5" \
+--replicas 5 \
+--test-count 20;
